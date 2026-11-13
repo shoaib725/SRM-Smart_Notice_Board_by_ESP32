@@ -1,0 +1,484 @@
+/*
+  SRM AP SMART NOTICE BOARD - ESP32 + SUPABASE
+  ------------------------------------------------------------
+  What this sketch does:
+  - Serves Login, Admin Dashboard and Public Notice Board pages from ESP32.
+  - Uses Supabase Auth (email/password) in the browser for admin sign-in.
+  - Reads/writes notices through the Supabase REST API from the browser.
+  - ESP32 polls Supabase and prints the latest notice to Serial Monitor.
+
+  IMPORTANT:
+  1) The ESP32-hosted pages work only on the same Wi-Fi/LAN (or its hotspot).
+  2) For public access from ANY network, deploy the same HTML pages to a public
+     host (e.g. Netlify/Vercel) and use the same Supabase project settings.
+  3) NEVER put a Supabase service_role key in this sketch or browser code.
+  4) Enable RLS on public.notices. Permit public SELECT; permit INSERT/UPDATE/DELETE
+     only for authenticated users (and ideally only an admin role).
+  5) Install ArduinoJson library from Library Manager.
+  6) Browser email check is only a convenience; enforce admin-only writes with RLS.
+  7) Fill in your own Wi-Fi credentials before uploading.
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <ArduinoJson.h>
+#include <DHT.h>   // Library Manager: "DHT sensor library" by Adafruit (+ Adafruit Unified Sensor)
+
+// ------------------- EDIT THESE SETTINGS -------------------
+const char* WIFI_SSID     = "SRM-SD ESIOT";
+const char* WIFI_PASSWORD = "password";
+
+// Supabase -> Project Settings -> API
+const char* SUPABASE_URL = "https://evodtiolbgjbhmmpiqbw.supabase.co";
+const char* SUPABASE_ANON_KEY = "sb_publishable_ykvQ_c8Xav5rHFY4bIAnDQ_Xix27yKL";
+
+// Sensors (change pins to match your wiring)
+#define DHTPIN 4        // DHT11 DATA -> GPIO 4
+#define DHTTYPE DHT11
+#define MQ2_PIN 34      // MQ-2 analog out -> GPIO 34 (max 3.3 V on this pin!)
+DHT dht(DHTPIN, DHTTYPE);
+unsigned long lastSensorRead = 0;
+const unsigned long SENSOR_INTERVAL_MS = 5000;
+float lastTemp = 0, lastHum = 0; int lastGasRaw = 0, lastGasPct = 0;
+bool sensorValid = false; unsigned long lastSensorMs = 0;
+
+// Table: public.notices. Expected columns:
+// id (bigint identity primary key), title (text), message (text), image_url (text),
+// document_url (text), video_url (text), created_at (timestamptz default now()).
+const char* NOTICE_TABLE = "notices";
+// -----------------------------------------------------------
+
+WebServer server(80);
+unsigned long lastPoll = 0;
+const unsigned long POLL_INTERVAL_MS = 5000;
+String lastNoticeId = "";
+
+const char PAGE_HEAD[] PROGMEM = R"HTML(
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SRM AP Smart Notice Board</title>
+<style>
+ :root{--navy:#431407;--blue:#ea580c;--gold:#fbbf24;--bg:#fff7ed;--ink:#431407;--muted:#9a3412;--white:#fff;--green:#16a34a;--red:#dc2626}
+ *{box-sizing:border-box}body{margin:0;font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;background:linear-gradient(135deg,#fff7ed,#ffedd5,#fef3c7);color:var(--ink)}
+ header{background:linear-gradient(125deg,#7c2d12 0%,#ea580c 48%,#f59e0b 100%);color:#fff;padding:30px 16px 24px;text-align:center;border-bottom:0;position:relative;overflow:hidden;isolation:isolate}header:before{content:"";position:absolute;inset:-60%;z-index:-1;background:conic-gradient(from 0deg,transparent,#ffffff33,transparent,#fef08a44,transparent);}
+ header .logo{width:112px;height:112px;object-fit:contain;border-radius:28px;background:#fff;border:3px solid #fed7aa;display:block;margin:0 auto 14px;box-shadow:0 0 0 8px #ffffff14,0 12px 36px #08052666;animation:logoFloat 4s ease-in-out infinite}
+ header h1{margin:0;font-size:clamp(26px,4.6vw,42px);font-weight:850;letter-spacing:-.8px;text-shadow:0 4px 22px #09052b66}header p{margin:9px 0 0;color:#e8e7ff;font-size:clamp(13px,1.8vw,16px)}
+ .brand{font-weight:800;letter-spacing:.4px;color:#ffedd5!important}.wrap{max-width:1100px;margin:28px auto;padding:0 16px}.card{background:linear-gradient(145deg,#ffffffef,#fff7edee);color:#431407;border:1px solid #fed7aa;border-radius:22px;padding:clamp(20px,4vw,32px);box-shadow:0 18px 45px #7c2d121c;margin-bottom:20px}.card h2{color:#7c2d12}.card .small,.card .meta{color:#7c5a46}.card label{color:#431407}.card input,.card textarea{background:#fff;color:#431407;border-color:#fdba74}.notice{background:linear-gradient(135deg,#ffffff,#fff7ed);color:#431407;border-color:#fed7aa;border-left-color:var(--gold)}.notice h3{color:#7c2d12}.status{background:#fff7ed;color:#7c2d12;border:1px solid #fdba74}
+ .site-nav{display:flex;justify-content:center;gap:12px;flex-wrap:wrap;margin-top:22px}.site-nav a{display:inline-block;padding:13px 21px;border-radius:14px;text-decoration:none;font-weight:800;background:#fff;color:#9a3412;border:1px solid #ffffff88;box-shadow:0 8px 24px #09052b33;transition:transform .25s,box-shadow .25s}.site-nav a:hover{transform:translateY(-4px);box-shadow:0 14px 30px #09052b55}.site-nav a.user-link{background:linear-gradient(100deg,#fef08a,#fb923c);color:#431407;border:0}.live-panel{max-width:1080px;margin:22px auto 0;padding:0;background:transparent;border:0;border-radius:0;display:grid;grid-template-columns:repeat(6,minmax(120px,1fr));gap:12px}.live-item{min-width:0;position:relative;overflow:hidden;background:linear-gradient(145deg,#ffffff,#f8fafc);border:1px solid #dbeafe;color:#1e293b;border-radius:20px;padding:17px 13px;font-size:13px;line-height:1.6;box-shadow:0 10px 26px #0f172a16;animation:riseIn .8s both;transition:transform .25s,box-shadow .25s}.live-item:hover{transform:translateY(-4px);box-shadow:0 15px 30px #0f172a22}.live-item:after{content:"";position:absolute;right:-18px;top:-22px;width:85px;height:85px;border-radius:50%;background:#ffffff70;pointer-events:none}.live-item:nth-child(1){animation-delay:.15s}.live-item:nth-child(2){animation-delay:.25s}.live-item:nth-child(3){animation-delay:.35s}.live-item:nth-child(4){animation-delay:.45s}.live-item:nth-child(5){animation-delay:.55s}.live-item:nth-child(6){animation-delay:.65s}.live-item strong{display:block;color:#172554;font-size:clamp(15px,1.8vw,19px);font-weight:850;line-height:1.3;margin-top:5px;overflow-wrap:anywhere}.live-item:nth-child(1){background:linear-gradient(145deg,#dbeafe,#eff6ff);border-color:#93c5fd}.live-item:nth-child(2){background:linear-gradient(145deg,#dcfce7,#f0fdf4);border-color:#86efac}.live-item:nth-child(3){background:linear-gradient(145deg,#fef3c7,#fffbeb);border-color:#fcd34d}.live-item:nth-child(4){background:linear-gradient(145deg,#f3e8ff,#faf5ff);border-color:#d8b4fe}.live-item:nth-child(5){background:linear-gradient(145deg,#ffedd5,#fff7ed);border-color:#fdba74}.live-item:nth-child(6){background:linear-gradient(145deg,#cffafe,#ecfeff);border-color:#67e8f9}.live-item:nth-child(7){background:linear-gradient(145deg,#e0e7ff,#eef2ff);border-color:#a5b4fc}.live-item:nth-child(5),.live-item:nth-child(6),.live-item:nth-child(7){grid-column:span 1;padding:18px 14px}.live-item:nth-child(5) strong{color:#9a3412}.live-item:nth-child(6) strong{color:#155e75}.live-item:nth-child(7) strong{color:#3730a3}.live-item:nth-child(5) strong,.live-item:nth-child(6) strong,.live-item:nth-child(7) strong{font-size:clamp(18px,2.1vw,25px);text-shadow:none}.live-item:nth-child(6):before{content:"☁";position:absolute;right:10px;bottom:-16px;font-size:76px;line-height:1;color:#0891b233;pointer-events:none}.live-item:nth-child(5):before{content:"☀";position:absolute;right:10px;bottom:-12px;font-size:68px;color:#f59e0b33;pointer-events:none}.live-item:nth-child(1):before{content:"⌖";position:absolute;right:13px;bottom:-15px;font-size:72px;color:#2563eb22;pointer-events:none}.live-item:nth-child(2):before{content:"▦";position:absolute;right:10px;bottom:-15px;font-size:70px;color:#16a34a22;pointer-events:none}.intro-splash{position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;text-align:center;padding:24px;background:radial-gradient(circle at 15% 20%,#fb923c 0,transparent 32%),radial-gradient(circle at 85% 80%,#facc15 0,transparent 30%),linear-gradient(135deg,#431407,#9a3412 55%,#7c2d12);color:#fff;overflow:hidden;transition:opacity .8s ease,visibility .8s ease}.intro-splash:before,.intro-splash:after{content:"";position:absolute;width:340px;height:340px;border:1px solid #ffffff24;border-radius:50%;pointer-events:none}.intro-splash:after{width:520px;height:520px}.intro-splash.done{opacity:0;visibility:hidden;pointer-events:none}.intro-inner{max-width:760px;position:relative;z-index:1}.intro-inner .logo{width:clamp(100px,17vw,150px);height:clamp(100px,17vw,150px);object-fit:contain;border-radius:30px;background:#fff;border:4px solid #fbbf24;box-shadow:0 0 0 10px #ffffff12,0 15px 45px #0005;animation:logoFloat 3.5s ease-in-out infinite}.intro-inner h1{font-size:clamp(28px,5.5vw,50px);line-height:1.08;margin:20px 0 10px;font-weight:900;letter-spacing:-1px;text-shadow:0 8px 30px #0005}.intro-inner .training-title{font-size:clamp(18px,3vw,27px);font-weight:850;background:linear-gradient(90deg,#fef08a,#fdba74,#fff7ed);background-clip:text;-webkit-background-clip:text;color:transparent;margin:12px 0}.intro-inner p{color:#e9e7ff}.intro-inner .developers{line-height:1.8;margin-top:22px;font-size:clamp(12px,1.7vw,15px);color:#e4e7ff}.intro-inner .loading-line{margin-top:24px;font-size:12px;color:#ffedd5;letter-spacing:2px;text-transform:uppercase}.intro-inner .reveal-line{opacity:0;animation:floatLine .8s cubic-bezier(.2,.8,.2,1) forwards}.aqi-good{color:#a7f3d0}.aqi-moderate{color:#fde68a}.aqi-poor{color:#fecaca}@keyframes dynamicBackground{0%{background-position:0% 50%}50%{background-position:100% 50%}100%{background-position:0% 50%}}@keyframes floatLine{0%{opacity:0;transform:translateY(24px) scale(.98)}65%{opacity:1;transform:translateY(-4px) scale(1.01)}100%{opacity:1;transform:translateY(0) scale(1)}}@keyframes riseIn{from{opacity:0;transform:translateY(18px)}to{opacity:1;transform:translateY(0)}}@keyframes logoFloat{0%,100%{transform:translateY(0)}50%{transform:translateY(-8px)}}@keyframes auroraSpin{to{transform:rotate(360deg)}}@keyframes orb{from{transform:translate(-15px,-8px) scale(.9)}to{transform:translate(25px,15px) scale(1.08)}}@media(max-width:900px){.live-panel{grid-template-columns:repeat(3,minmax(0,1fr))}}@media(max-width:560px){.live-panel{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.live-item{padding:12px 9px;font-size:12px}.live-item:nth-child(5),.live-item:nth-child(6){padding:15px 10px}.site-nav a{padding:12px 15px}}
+@media(max-width:600px){header{padding:18px 10px}.live-panel{margin:12px 8px 0}.live-item{font-size:12px}.card{padding:18px}}
+
+h2{margin-top:0;color:var(--navy)}label{display:block;font-weight:bold;margin:14px 0 7px}input,textarea{width:100%;padding:12px;border:1px solid #cbd5e1;border-radius:9px;font:inherit}textarea{min-height:130px;resize:vertical}
+button,.btn{border:0;border-radius:9px;padding:12px 17px;background:var(--blue);color:white;font-weight:bold;cursor:pointer;font-size:15px}button:hover{filter:brightness(.94)}.secondary{background:#e8eef6;color:var(--navy)}.danger{background:var(--red)}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.row>*{flex:1}.notice{border:1px solid #e1e8f0;border-left:5px solid var(--gold);border-radius:10px;padding:17px;margin:12px 0;background:#fff}.notice h3{margin:0 0 8px;color:var(--navy)}.notice p{white-space:pre-wrap;line-height:1.55;margin:0}.meta{color:var(--muted);font-size:12px;margin-top:10px}.status{padding:10px 12px;border-radius:8px;background:#eef4fb;color:var(--navy);margin:12px 0;white-space:pre-wrap}.hidden{display:none!important}.tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}.tabs button{background:#e8eef6;color:var(--navy)}.tabs button.active{background:var(--blue);color:#fff}.small{font-size:13px;color:var(--muted)}footer{text-align:center;padding:28px 16px;margin-top:34px;background:linear-gradient(135deg,#431407,#7c2d12);border-top:4px solid #fbbf24;color:#fff;font-size:15px;line-height:1.75}footer .credit{margin-top:10px;font-weight:700;color:#fff;text-shadow:0 1px 6px #0006}footer .credit b{color:#fde047;font-weight:900}footer .brandline{font-size:17px;font-weight:800;color:#fff}
+@media(prefers-reduced-motion:reduce){*,*:before,*:after{animation-duration:.01ms!important;animation-iteration-count:1!important;scroll-behavior:auto!important}}
+
+/* High-visibility dashboard refinements */
+.live-panel{max-width:1540px;width:calc(100% - 28px);grid-template-columns:repeat(7,minmax(0,1fr));gap:12px;align-items:stretch}
+.live-item{min-height:150px;padding:20px 12px;font-size:14px;border-width:2px;box-shadow:0 10px 28px #43140724}
+.live-item strong{font-size:clamp(15px,1.35vw,21px);line-height:1.25;overflow-wrap:normal;word-break:normal}
+.live-item:nth-child(1){background:linear-gradient(145deg,#8ec5ff,#c9e6ff);border-color:#3988e8}
+.live-item:nth-child(2){background:linear-gradient(145deg,#8cf0b3,#c8ffda);border-color:#27b765}
+.live-item:nth-child(3){background:linear-gradient(145deg,#ffe36e,#fff0a6);border-color:#e8b800}
+.live-item:nth-child(4){background:linear-gradient(145deg,#d8b4fe,#f0d9ff);border-color:#a855f7}
+.live-item:nth-child(5){background:linear-gradient(145deg,#ffad66,#ffd2a3);border-color:#f97316}
+.live-item:nth-child(6){background:linear-gradient(145deg,#69e5f4,#b4f8ff);border-color:#0891b2}
+.live-item:nth-child(7){background:linear-gradient(145deg,#a5b4fc,#d8ddff);border-color:#6366f1}
+.live-item:nth-child(7) strong{white-space:nowrap;font-size:clamp(13px,1.15vw,18px);overflow-wrap:normal}
+.live-item:after{background:#ffffff20}
+.intro-inner .developers{font-size:clamp(16px,2vw,21px);line-height:1.75;color:#fff;font-weight:650;text-shadow:0 2px 12px #3b120a99}
+.intro-inner .developers strong{display:inline-block;color:#fff5a8;font-size:1.18em;font-weight:950;text-shadow:0 2px 10px #0008}
+@media(max-width:1200px){.live-panel{grid-template-columns:repeat(4,minmax(0,1fr))}}
+@media(max-width:700px){.live-panel{grid-template-columns:repeat(2,minmax(0,1fr));width:calc(100% - 16px)}.live-item{min-height:125px}.live-item:nth-child(7) strong{white-space:normal;font-size:14px}}
+
+/* Intro splash: words float in one after another */
+.intro-inner .w{display:inline-block;opacity:0;animation:floatLine .8s cubic-bezier(.2,.8,.2,1) forwards}
+.intro-inner .training-title .w{background:linear-gradient(90deg,#fef08a,#fdba74,#fff7ed);-webkit-background-clip:text;background-clip:text;color:transparent;-webkit-text-fill-color:transparent}
+.skip-intro{position:absolute;right:18px;bottom:18px;z-index:2;background:#ffffff26;color:#fff;border:1px solid #ffffff66;border-radius:999px;padding:9px 16px;font-size:13px;font-weight:700;cursor:pointer}
+.skip-intro:hover{background:#ffffff3d}
+</style></head><body><header><img class="logo" alt="SRM University AP logo" src="data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAcFBQYFBAcGBgYIBwcICxILCwoKCxYPEA0SGhYbGhkWGRgcICgiHB4mHhgZIzAkJiorLS4tGyIyNTEsNSgsLSz/2wBDAQcICAsJCxULCxUsHRkdLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCz/wAARCADwAPADASIAAhEBAxEB/8QAHAAAAQQDAQAAAAAAAAAAAAAAAAUGBwgBAwQC/8QASRAAAQMDAgMFBQQHBQcCBwAAAQIDBAAFEQYhEjFBBxNRYXEUIjKBkRVCobEjM1JicoLBFlOS0fBDY6KywuHxJFQ0REVzg8PS/8QAGgEAAgMBAQAAAAAAAAAAAAAAAgMAAQQFBv/EADYRAAIBAgMFBwMEAgEFAAAAAAECAAMREiExBBNBUWEicYGRscHRMqHwFCNS4TNCBVNicpLx/9oADAMBAAIRAxEAPwCyFGKKKkkKKKKkkKKKKkkKKKDsMmpJCim5ddb2yA/7LG47hMJwGY44t/An/LNMrUevn4YUm8XqPZRzEOL+mlEeYHw/MprDU22mpKp2j09zoI0Uja7ZCSdNukG3I4pktlgfvqAJ+XOm9I7QbWl3uoTEq4OdAy2cfjv+FQRce1GC24r7LshfdP8A8zc3C4o+fdpwPqTTbuWvtU3RBaXeH2GD/sYuI6PogD8ayttG0PxC/c+w9ZWKkvM/aWOma1u7aeI2yJb2+fFOkpb/AAUU035naStBIXq2wRj1S0S6R/hCqrwLTdJMdyaIEx9lCStb/dKUkDxKuX415s9ukXu6s26GWRIfVwth51LYUegyrbJ8KWUqN9TsfG3oJN9bRRJ4X2pxE7Oa6Zz/ALqC4f8AorwjtWhFWEa5bz/vIDgH/JUQTdFXK36qZ07NdisXB4pSEl7KUqV8KSoA7nI+opHucI2q6SICnWZDsdZQtbCuJHEOYBwM4O1DueZb/wBj8yt+3IeUsVE7Sgv4NZWN/wAnkqa/5kil2Fre6yCO4j2y6J8YUtCj9Aon8KrsOzvU67bFuCITLsOYkKYdRKaw55AFQOfLnSDOt8qz3F2JMYVGmMHC21jC0HGd/rRbuomYdh439QZe+/koluka6isrCLlAmW9Z/bRkf5/hS5BvFuuQBiTGnSfuhWFfTnVP7ZrbU1pATDvUxLQ/2S3O9bP8qsj8KdNv7VgspRerKw6f/cQVezuDz4d0H6CiWvtKcQ3eLHzFx9peKk2oI+8tJRUPab7RWpa0N2a/ty1nlAuX6J70SScK+SvlT9t2tIb73stxactksbFDwwnPr/nWpNvpk4aownrp4HSWaJIuhuI5KKwkhQBSQQeRFZroRMKKKKkkKKKKkkKKKKkkKKKKkkKKKKkkKKKZ9/1itLr0Gzd2460kqflrUAzHSOZKjtt48vWkV66UFu3gOJ7oaIXNhFm+alt9haHtLnG+r4GG91q+XQedRtq3WymGirUE5VuYUMt2uIcyXR04v2R5qx5A0wdRdpLMSQ+3p91ciaskO3Z5OVE9e5SfhH7x38MUy7DYbtrG/iFAUHpb6uJbsh4J58ySdyfTJrlO1XaDapkP4j3PHuGXfCNRUyTM8/iLV37SbrKS5GtTTdlgq2KY6iXlj9934j6DA8qacdoTZyGS8ywXVbvPqKUJ81HBNO2zwbTpbXkqyaijtSMOKie1uJOIyiCA6GzsoAkH3s7b02rxa5djvEq1SW+CTFcLa/A+BB6gjBHkaLBhAtpM7EsbmPDUHZLe9JMMXSUw3e7YEhbxhLVhO2cK24gP3gPpSFrKLFYvbD9njIjWuZEakRUJJOElOFAkkkqCwsE+VPKJqvUti03ZdW2p5xxhLJt9yYWCtla2iAhSh0JbUkZG+U0ka/1fp7WNltTlsty7TcYzjgfjpQO6KV+8SlQ/e3xgczTmCYTaQxa0VJfvXYprKyvOqfXBSiWwgqJ4Uj3iB4D9H+NRUhSy4hxtRacQQpKhzBHI05NKaxl6NYuAt8ONIcuDfcurk8Sk93+zwggdTuaQXHDLeUpDCUlRzwNJOE+QG+1AzAgW1EqTPqJ2LeLFZe1LiR7VBhrYkIHWUPca28lqKvQCoQL2MqAJPMk8zSs2xqJVnNsaZuCrcp32gsBpRQXMY4sY54rU1b7xFeQ8i2zEOIIUkqjKIBHkRg1T1Fe0KxPCS5rCPYGNF6Ds+oXZbLKIftCgxw8OShOy87gEkjI351Ddydlybi5JuBdXLWElzvBhXwgDI9AKcUrX2qHnGFXkRp5j/qvtC3tr4PIEpBx5UhTLibtqB663TvH1Sni6+GVBsqz0SSCB9DRu4fQyjJSVaPYOyLS4/ss3errdJGRxR1FTbKiSAVowRkFOCTtk+FM/tQ0lb9IazMC1vrdjrYS8ppa+JTCiTlBPXkCM74NPe19rNrmdpFjllL1ts7VvXbnmXfhazuFcSTuMpSM4GMVGd5tDydXSbdHkpnFyTwR3GnA53wUr3CFZ3yCKOoVw9mQxJbZcdQtbbDjiW91FKCoJ9fCnPYu0S82xtEWQ6i625OwjS8q4B+4v4kfI48qf+nGpV27IJen9NT12zUlikrelssr4VScKV94cx08MpA5EVFWpLwxer69OiQmobTqUZbaQEgrCRxKIGwJVk4HjSnpgLnneQEqbiTjozXTEoBNinLWvmu0zFDvB492rkv5YPlUmWPUsG+IKWlFqSj42HNlp/wAxVOZFouMGPDnvR3WGJI7yO+PhVg/dUOoI5cxUgaY7SW3XWY2pH1IfRgM3VGe9R4d7j4x+98Q86QhqbN/izH8T7Hh6d00iotTKprz+ZZ6imjYdYcbzMG7KbS46kKjykKBakJPIhQ238fyp3V16FdK64l8RxHfAdChsYUUUU+BCiiipJCiiipJCjIAydqKY2sdRhwyLbHlJixY6C5PmH4WkDmnzPTHUnFZ9origtzmToOZhohczm1Zq5MliUzGmphWqKP8A1k8+H7CPEnkANz6VAertcuX1P2dbULg2VpWUsE++8R9909T4DkOnjWnWOsnNSSURozaotnik+zME7qPIuL8Vn8BsKcXZ7oK0av0lc3nLkhm8KdEaK26MIQrHECfErAUB4YOxNctEd3xPmx+3Qfmcp3v2V0kb5z0rdElSYM1iXEeLMhhYcbWOaVA5Brqvdmm6fuz1tucdUWW0feQrqOhB6g9CKT/SrzBiZL2r0WLtGtMDU0W92m03ZLQauUea73eSPvAAEnG+MDcY6imFrO9RL1e2VxHlvtRIjMT2haeAyC2nhLhB3Gemd8AZpPsljuF+miLb4ynl/ePJKfU9KnDR3YXDihuXfMSXeYQoe6PRP9T9KJqhc4VFz+eUYqFszkJDdp0zftRtstQ2H5EdGyC4ohpGTk4zt9KkmwdgMiUhLl2lqaB+40OEfU7/AICp1gWuFbWw3FYQ3wgDzxXZt1pq7MzZu3l8w7KNBeR/aOxrTFrCSYyXljqscZ/4s06o+l7NFQEtwWwB8vypGsGsHZ93VBlJRhxagytOxHPCSPTrXqPLukftBejuBRjSMkA/DwhOyh9MVnSrsxVWVb3NudvOPKOpIJtleLr1vtMSO487GYbabSVKUobADma1W9my3WA1MhMR3mHRlK0ox/4NNPVWpouodMXmHb1KK4a0lwf3jQUOJSfEZ5/96TND35rTWj7pPmFXsqHwlhGcd46RulP4Z8N6aalLehAota97Rd2te8kGRpy1SkFLsNBB6ZNNi6dkOlriFEQGmln7yU8J+qcUqT9Vpc0jHuttIUqXhKCd+A75z5jBFdOlJr8iwsrmu5dccWlClq3Xvnbx6/SoTs71tyFztfLL0h2fBjJykQ3/ALAX2kqdtM0gDcIWOMfUYI+hqMrjp2/6PuLUt5iRGdjrC25TO6UqB2PEOR9auDLnRIDaVy5DbCVqCUlascRPIDxrxNtkS4NqRJYQvIwTjejOzFT+23gfmJsp1Fu6VWt3aRIs67jNgWWDHvFybU2/PSpYJCjlRDeeEKJ322z0rk0HoqdrW/MxUMuswEqzJlhJ4G0jcji5cRzsPPNSprnsNjyw5MsTgiu7qLYHuK9Ujl6j6VEDLmoNCXZ5pKnoL7iChxB3bfQdiCOSk/62pePtBasBkIz4Rzdputm7rIb07p93uNO2xIYbbb+F9SfveYGNvmetNJvS13kacXe24YXBQrBUFjj4eRXwc+AHYq5ZpPjRJc19LESM5IdIJDbSCpRAG+AN6li02m39kWnU6jvbCZGp5zSkQbeo5DKVDBKx6Hf1wNyaYAahJbSL1jM0frRWngLbcuOZZnFZLI3XHUfvtHofFPI/jVhdKatQlEWLJlJlwpKeKFPHwuJ/ZV4Ect9wdjVbNTSLM/IhyrW0GJEmOl2ay0P0DTx5pbzuB1I5AnApR0RrJdhkKgXDjfs0pWXUJGVMK5B1HmOo6j5VmdWR95TPaHkeh/Mo+nUAGB9PSW7opo6R1AtakWua8l5RQFxZKTlMhsjIIPXb/WRTurq7PXWumIeI5HlI6FDYwooorRAhRRWqTIaiRXJDyghtpJWpR6AVRIAuZIh6svjltitw4I47jMPAykc09Cr/AF/Sq49oerG5Tp07bny5Cir4pL6TtKfHM56oTuB47nrT019q5+Ba5FySrhut44mYac7x442WseBPwj1UajrR2iF6rdUqVc4dmiBYZQ/JUB3rpGQ2gZHEcbnwyPGuGGO0PveenQc/H0japwDdjxm3s6uWlbTf+81HbBObeBaS48QppjIxxKRj3vXoNwDUhptGhEXqdbBOk6XkTmO7XEeXxxncniaeZd5bKAUk58RgVEGo9PyNN6kmWSVwuSYq+AlG6VAgEEeoIrrXqWSnSA07IjtOrZeUW330BTkZBxltGRlIKhk/hjetCPhyYTPFzVev5N707GsVyhxZ10gOLZduS0JWtSAcAIV543V128yefQvZ/cdYTkq7pTMEH3nBzX4hP9T0rHZ9oOZq+7IK0EQUK948u8PhnoPE1aWyWSLYrciLGQlISACQMZx0HgPKlDFtD2Gg1Pt3xqoAMTRO0/pWz6QtiEtNsshvGVnYAnbmevmd6cSVBQBByDuCKQdSraudmnW+HIadmNcKlMJUCvYg44efKmdGnXNvQt6Q266BGQhxpScgt+/7wHhsM0R2hdmqCiq5EE36iOwF1x3if2i3S5WbtAbmRHnmVCOgtFPwqSCcgjqM5yKXtQ60nQjY5EVIaEmMJLzSxlKuLGE/LekbSOo06ouTVk1GymeMFcd9acLQoDJBI5ggH6Vm7Kb1+tuNEQmDcYfEmOlRw2+1n4c/dUAM+HOsjVCVZqb5sch14/nGUq55jSLcGHbRGXq+MsiOwhyQqN1StIOU58M019DavvF3vVytkp7vVXRt5bKs/qXeE7J8E4HLyFLRmRdDaahWK7tGQbgp0y0pVu20rKcjxPL6GkxrSg0Lbpuo2ZiJIQzwQXG+pcPCFn0SfrTFXd2wi1s2t3SMxY5zk7O4kyHqiRLnNLaYhRnPaErGOfu8J88g7eVdfaA6zd9KWyRBihiPEfWh5lse62pQ907dDvv4mlOxa4jX/TN2j3nhjOx2QtyQhHxoJACiB1Bxn1pZscGNp/S1xuM5xiZHWnvClshxCkpGw8CSTQIjG1OmewQSTy/LQrLhJOsT9DxWIXZkXbs1xMHvJyWlDB7sDn5ZwfrTL01qKbqbtKtT5KglDp7thvZtlrhOQB6detOHSeo3tS6lmQbiQY1xirY7tIwlpIBwlPgME1usLdqsGo2o2n4w/TvJbdmPHicWnO4SOSU+gqGrTwowNhe3U2lBGNwI2Jk6dqnVyNnXH3nQllvfDac9PAAbk0+5vaA4/f2bda20lovpaU8oZK/eAOB0HPetqtR2C36ybtFugNd/LcLMiUhIHCoggJB674z0poTJdo0Lfg00td3uMcA8BPdtMqx15lSuuOlCVelco+p7RkUrxEmCRKYiMl2S62w2PvLUEim/q7RNq1ZbVsyI6C4d0qGxB8Qeh/0aZ+p415uuplPzSY1sYCFd65s003gFSsnbOSfM087Prix3ye9Ft7y1iO33i3lI4GwAQOZ36+FdAVVrsyOLAac4H02tKw6r0detEXtK1OOIbQ5xR5TeUEKG45fCof8Aik7UeoZup7om43NZcl90hpS8n3uEYBxyBPXG2cnrVttRaft2rLKuO822+26j3VZyFDpuPwPSqrax0bcNJXpUZ8kx1kll0j4gOh/eH/elNipnCTlw6xbpliWcel7G/qXU0G0Rhlcp0JKufAnmpXyAJpb7SYFoi62uDOmg57JGOJKQjDbK8gHhI+6VHHTByOWKWtP6+s2kdGF6yWaKxqh5ZZekuZWEoxstIPj1SCBnxGBTVVrm8+yyYrfsTLEpJQ+hmEygOpPMKPDk+PPnvTLIFtrFR0dmup3iprTs6TwEr47a+Tu07nPd5/ZUeXgr1NWK05eRebYFrHBJaPdvIIwQoeXnVLUlSSC2ooIOQQdwfGrC9nus/b4Ua9OuAvAiJcwOq8e67j94b+oVWUVP09TfDQ5N3cD4endNVI7xd2deHxJkorCSFAEHIPIis134mFM3XFwD7kaxId7sP5ekudG2U7kn6E/KniohKSScAcz4VAnaPqcM2C63ELPf3p4wI/ilhOC4R6jhT/Ma523NdRRH+2vcNfjxjafZu/L1kVawvv8AajU8m4tFTccYZit/3bKdkD6bnzJp+afvHZ7qXT0HTGo4C7QYeRGuCXsklRBUVqxsVHxBHLcYphW+xtzbJIucy5sWxAX3UZDra1mSsDKgOEHhABTudsqArqm9nup4GmxfZtoeYgEBRWrHElJ5KUnOQPMilIWXMCZ78ZLHaBrTVGiGE4i6fWxL9yHNYBU8tPDsrBJ3SMbnI3HOoYsVlk6mviIzaXCXFcbrvMgZ3PmSfxNcMibJfjxmXnlPNREFtlJOQ2kqKiB8yasJ2LaNRBtwukpopeVhRz+1jYfyg/U0raKjOQianTpzPh8RtJQxu2gj+0dpeNpaxsxWkBLnCAr90fs/5+JrstWpLRe3FtQZqHXWyQpo5SsY57GlJKkqJCFJURzweVQrcNPX6wav44sZxaEv97HfbSSFJznGR1xsQadUY7Kqimt14w74ySZs7R2plu10ua0ruS8hDjLqTg7AA4PiCKdbmuCxo22T5UVl9U5K25CDsHCn3VYx4896SdU6hS5qqXbLnBbn2tpxIDatnGjwjKkKG4pwXyyWOfpmHbY8xmIce0RFOHY555Pnn61kUnFVNFvDreFbS8StNwdKxQvVMJ+S2zFPvx3BxFlShw48SPe258q8RtPJhXlu/wAS4sOWRhZkFwK95AG5QR49K8WrSki3Wa9N3l9ECM8ylHelQKOIKBSrI5jO3zrkZ0xd4+j7hFQW3C+6h1DTbwV7QlGeJSPEbpPypRViFxU9LnLmPY2HtDBAvYxM7RIs29i3anhsurhyYwQsJHF3KklWQf8APypxRHUR9B2zT97aWEyovG4tPxsZWS2cdcDpSXPvty0xp60WhvjiSOAy3RjcBSjwoI8OpFOC6wpOr7Lb75Ab/SOMhLrOcHYnOPHBzUqOxVzS+uwuLecumi4hj0iK/wBn0q36TvT8Z9uct9hvuEsg++hKkrVt4nGwpO7OY1xvdn1DaMlth5hKkcXJLpO31A39KUNby5Fl0dYWodxKXGZLnE/Hc+FaQRw5H8RyPKtbPaB3PZ9JmMNNs3iTI9mceaRjjIQD3uPHh29d6aopqwuLWGY7xp94o6kCebZpGdYHZLssqNxlsvRoEdvBUVFBBcUeQHQetd+l7VGgXH2GbPbd1EiO66iK0riDRA24jy4t+Xzr1p28ql9n8i94cculniuxW1K32wCFeuPyNM/s3bmSe0Jh5uOtbjIcdeUo74KCPePmSKAU6YZLLe+nT+5eIgGxnZoiwy7rqaI53LiWoriHnnVAgJx72M+J8K6ZekoYvCtS3qQpmDJkLfRHxl+R75IGPupxjc9PDNedRa5vE29L9hk+zRIyiltDR4QpQ241ePXA5cqU9ewL5ddTxPZ4b8hCozYQlCSQFHJVk8hvjOfKgGBabCkMRBktc5xU1Mi59oGjGxaWkMBEr9K046BlKU5GTyG5BxSfpjRENFpkwGbvGeujykuPdzlbaEJ5Jz13Vn6V13y1y9O9nMe2MlSnpDxVKLWTzGeEY6bAeda9IadvVt09dbiWnG5UiOWorRBCxn72OnTHXanODUqBKi3Ns/6kXs9oGOu3XizWYQ7ALih6WkhoJQColROTnGw38TXH2g6Qjas088wtOHQniSsDJSRyUPMfiMim5oXQ9wi3xq63JlcVDGS224feWsjGcdAM5qTu9bCw2XEcZ5JJGT8q2UQ1WjhcYeXtBvZr6yklytcq0XJ+DMTwvsK4VAcj4EeRG9cw2qbe3XR5ZCb7EbA7vZ0Ac0E/9JP0PlUV6fnWCLGmovVoNyWsJXG4XVNFKwcEFSfulJJ5c0ikICThbURLrhOWkRudOzs6vjVl1SiPLc4IFzHskjPJOT7i/wCVWD6E1IFl0hpB6wt6nuljj27Txipd4nJb6n1u5IKEjiGRkbHG4I8zUQ3l6DLvct62xFwbetwlhha+NSE+BNG9Ows2YMoEqQRLeaQnrkWtUORkSYK+5WDzwOR/p8qcFRT2d6k9vYs90W6FGc17FK/++3gZPmRwn+Y1K1aP+PqE0922q5eHA+U0VgL4hoc4g60uJtulZa0HDjqe5RjxVt+WarV2qSUL1HHtAX7lojJYIH96r33D9VAfy1YHWjyH71ZYDn6kOKlPeHAgZ3+QVVUbtcF3a8zbi6cuS31vKP8AEon+tZarY67NysPc+0Fzhpgc8489Ga8sFisjEK+ab+13re+uTBeCgOBSsZSoHmMgHr6bUrTdZ6iuNlvOorte4S4lwirhR7Qw/wAeFODA4m/u8AyeI7kjzqK8+FY65JpgqsBaZ7xf0RZRfdURo6kkpbUFqSOROfdHzOKuBa4DVrtjENoZDScE+J6n61B/YLYEuOKuTjWfeKwo+CfdT+JJ+VSZ2jyL5A08idZJDjRYXl9LaQSUEc+XQ/nStmOb1yL2yHhr9/SaiMKBeefxOe6WG7xdTfaFsCi0tYcyg7g9QR1B/rTWsq9Q6V7UnoL3tKrbMkLUUqyWlIUSQpJ5AjIzjzzXrT+qL9q6w3C3OrWubGQJDDzfuqWAcKQcY3wdvGujRWpJn24i1Spi5DMniQUOrypBwdxnf1FZ1NNKowXAY36X4iGxLqL8Jm7woOupguemprSpK0jv4rvuLIG3EnOx2+W3Osa407Ot2nrO6HCtENj2aUUcgcgg+mc/hTbat9309q1mK3HW29GeSUKA2WjiAyPEEHf1pZv19uOnu0C6vIeUG3HE8TC923E8IxkeY60pmQ03aotiTY29beEgvcAGavb59z7KbnERxviC40sE7nuickegIz/4pI0la7hqaz3K0pfLaoqPaoqiopCVH3VIJ6JWk/UVJf8AaS3W1qMuLbWURJ0VMlaG0BJOTg7cjgZ2pn9oJtlq01HbsI9ni3h0uPuNk5V3YACPIAnl5U0BB/vfCLH29YLKw7RGszcrXbY8K0Wi6Tn7fdGo6FKelZcbIVuUcXNPCcgdKXr+/K0ro5+Bbn+J1i2JUHEebuFrH+Immo/brxrjSEC8R8ypUQqhvA/E4kHKV46n3sH60pIXd7A5ZDco5URDDCm1jKVNlR4kH5Y/CqNUUSz4bA2z6GEql8hOPs1tbOobJerbeGiIIcaWhZVw928cjKSeuMUrr0pbbtaJ1htAXGlw5RkIdexwuk+6RtyGBgegpA7RpbKXrdDtGYVt4FSEobHAFu8akqUfEgp+VOS3XRyFJ09d7kUoRMhuPyl4wpSm0KAV/MFA+ZxR5YhT4DInmD/doAtY3mi2vW7R0W3QX5iZRX30mYlscXeKKe6S0lPXckeeM16sV8t0K4qfchLjoKytEWLhLaD+0tWcur/AdPGuezx7XMmydW6hmMW12bxiA08oDgG4DgT1x088mlzTGkYMh1q4C7MXKO2vKAx8JUPE56bbVVtoOFaIFvQfmcNd3mWnIjRdhs+pGly57alPr4okJQxlWcjjPhn0FN/UV41BaWPsOZeFuTHD7RNdbUQOJe4aR4ISMepJpFuE2Tc9UvvrDi5r0goSBnIIVgJHptT214/pSBeUSbhEeuNzCElcZtzhRy2Kz6dPDpQhxUR932bHWARa15ps12naY7Ln7i20VyJMjhjZGQARjjPj8Kjv+VI2gH7ld9XG4yFSJQiIW8644sqGeE4SM7Ak/gKdD2t7dJ0Cu4XC1xlMF0R2IYJUlSgM4JIGw8h0pO0Vque81dZRjx2rdAjl1MWKwltJWfhGeedjvmnnDjprivYfhgzmsj2qL/eJV+T3zvs7Lns6eEhsLUOEJQDscAk58t6XND6XujF1Xd70yUOhJDaVq4lknmo+G2frTCYm6q1pqFtpudICnF7pZcKWmUZ3OBsAB9aXdRa+uybybXa3XY8eOruGuBPE48U+7k533I2pKNSFqj3Njl1MvPSSVqW0sXexSIz7fGkpOU+IIwR9M1UKa1K0zqhbTTgEi3yMoUoc+E5SfQjH1q4ljamoscVNzeL0woy6pQGcnfG3hyqt/bXp82vVrc5se5ISW1eqeX/CR9K21xZ1qaX9YJGJO6IOutd3HWt2S46r2a3RxwxYaNktjGMkDmfPw2prcJVnAUrAydulSBo5fZwjSwm6tiSXJ7UhbKWY61fpU4CgogEeJGcjlT49ts0y4P6U092euMMXGMpv7T4MANqb4kuBWDkfCd1Ue7L9omJtGl2TT1rg3i0pxxtBFxY35KSeFePkpJ/lqytulidbY8ocnmwv0yN6qT2aT2YHaNa+MlCZThhujphxJR+ZH0qzmiHlKsBjrzxxXVtEeG+f60jZ2wbTb+Q+6/0ftNK9qj3H1jN7Rp5ju6km5x7FaSyg+CnMI/8A2Gq0chU8dq0ojTWqXM/rp0eN8gSr/oFQNkUqmcQLcyfW3tAr5MByAmc1jhJG1Fb4bSn50doc3HEp+pAphNheIGZtLS9kVq+zdIICvi4UI+icn8VGvF27V41vurkRFofdQ0oocU4sNq88JI/PFOXRzIa0vG5e+VK2/iI/pSLrhrSSJLbt5ti5kzhyO5CkqKenEoEDHqaGljp7IjqwXib9c5sqi9Qgfloiag1enTVxhzbNbYLcWewHkrMfgUvf3kkjBBBx9a7b5fBcNDx9T2aOmJLLwDriW08aDukgqxuM4/CtVw1Fpu5aNcYYsJkogAEQlENraRyK0qGdhnfHjvSE3eY8jSCXLKiS1GhPETYry+9QtLg2yQBlPukb7jPzoKlWwYhrgi+XDugqO1Yxx6J1jLvzhi3VaESoiS8h5CRh1GMKBHQjIORTcg6msuvLvFh3+P7HcSe7ZlxlYS5vslSTnn09elLumYOkrP7LdvbnY4uLbiG2pJyEfdWnjA+W9MyX2e3u2amjIhx++hKkNliW17ySgrGCSORGRV/uGmt+1z48rSjkY+9Z6fW/bY8WwcDsq3s9wqMVgOFGMgjPM/nmkazWgf2SiWvUjKw1Nnr7lxY4Vx1BsHJB5DiCkkHxzXXryDLfuzV4tU3vo+QFLYcB7pwbZJHLOBv5Una1vs6U9bY0hotuMxAt9Ctj3ij734JH1pTFKdWo7LY6dCP/AJGm5UZzomaji6WhWO32eOmTB7lxxYeHCp3K8cYI+EkpUfQ04XlP3C3QbvZ5KJsdauIW+4e/7w2IQvmlQ5bkiuLVtls+p20CLcYsS4W5pKltK90JbWAoA45AZ59M715aL2jLBGt0d9D77bvtBXgKQpC+Lhx/h5053eliNT6ABpAVcRAXWa9LPWu/G626bbUOyYbz0mOxIT7yAs5Uj5K5+tIJh3W/32xWS5LUXm0qcfSdi0hR4uHHTCQNumQKUL9czGuNp1lEj904XTHmNp5KIH9U5+grzpS6B656k1WW1KeGENBXJPGrb6BIpRdHAucvUa/1LwkHDxjduOidW3zVzzb1scbCl4TIVgMtoGyQk5+EDAAG/lSrKvVytZZ05p2StlmMruEqbSO8kOZwpZPmrPypyWG8zn5Mi8TpUlcGI0pxzchBONkgcia4tM6gfumr35DNogxkdw66A00C4pQG3Evn5bY50tXSqAUJXEfEiWyGmbHOOWFaI0K92xox2nbolgvSZak5J5BRH7ylHn4ZqPbjoXUl11VKefDLDcl9S++fdSPd4tsJBKjtj/tW/Rd5uStbd66S9ImNug8R+NXDxAeW6RSpCh35hq56gkMPIlRWFrR3nxOOFOwHkM58NqY1VayqFQkEnwHMwQutzFi52PSbNot2mZly7t5pQShDagXVqWQCSMHGSee1Na9X9vT639O6aaZjxGFFMhxxAdW+v72eLbA5cunSkvQGmLjdNXNXmWlxuFEc9odkPZAdUNxgnnvvnyp1NaXsF01FcLixcXLgww4ZDkaM2VFZUonh4uRHkPrTHx1EBpAKTl1sIK2vnO3UGtmtMRo0e1W6OJT7KHnPdCUN8QyMgYya1RtW2u0aZj36XaI32hMcWGgyylClAHBUVY2GevnXbP0pa71exNuM1UNb5TmEpbYXsAAM522A2FJeqdQaXUpq0OWEz48I8CSlfdBGNsJxuf60bPUplmdgBoJLA6Rx6S1qjVLrrSYLjCmk8SlpVxIHgCdsGmH2/QSqyIlgbtOIXn1yg/mKlSxwYUC0MIg2/wBgZWkL7opwoEj73iaZnbRHD2h5JJGzSj9ClX9KdWVhQBc3II9ZaZkjoZVwgL586edp7VNVWTS32DDnITECS22tbYU40k9Eq6eWc46UzSPCsUsMV0MyzdEkGHPjy0qwphxLoI8UkH+lW60u+n7fvDKPgcUiQj0UM/1FU/xkEVarQ8gu3GA7n/4qzx3D5kIQP6Uom1Sm3/dbzBmmhmrjp7yPO1XJ0dcc/fvic/JDlQsrCehPoKmvtYZWdG3dKf8AY3tCjjwKXBUb6Gny4Ooo7DDwSzIXh5DnwcIGSryIAO9LpMVoBuV/UyVQGq2PSJ17s71nTALiVAS46XjkfCo80/Lb614sTS16ht4HIyG85/iFSbqPVsN3Tc56xTWnZEdaUOEDKkpJwVJzz3I35VGFrlOovsN4EqIkIUSdyfeFLp1Hq0mxCxzl1aa06gwm8uNpoJa0tCKiAA3kknAG5pvalvWkr4pNuevTTEpBwh5AJSknoVfCR86XNNJTL0nFbfQFoUhSFpUMgjJBBpm3TsyscK6JlO3sW+EtWQ04QFfwpUT/AENbBibZaYVQQQL37oT5VDzvNltstv0nqRhU+XNkLWnKFMxFdwcgjClDP0+tIFy1RerJeJkOJardaEceHI6GEqDg6FRx72R4Y51u1xJ1FbZaEsynjZwkeyLjLIb4AMAFQO6vMnfpSxpDi1Zp91WorX7eYxxGecBS44MHKArbi9cnnSBqaFHs2/O/ug9TOO7sytZ6IiTbZFDEiAtTb8VhOygcHKR1GwOOfPwrboKZcYNp7qWt5mKiWlltbiSO7UtKhgg9OMI2/eroiTG5zMuBZ4cy3vNNLcZjR5HdoUpI5LwM5PLOTvTNsuprtfJEixTJ7wEzLbYlK4kpXzAJPvJOQMEHn0qkqIStVTc6dCRLZWXstOVFlv2lu0dsRWnWUuScoWtXChaCrdKskZTg4POpGuttt141w9aZ7BWp9bUplYJH6MIwtOR0y2n/ABGsq1U9P0fMiOMIVeoADcmO82FnAOC4EnnTOt9wft14tWoGwRCS+YzqASUt7ZUE55AhRIHQg0ZqU6ZCDMHPw4ygpIxRDd+1rX2qnCSJ5uGAnHxJUvYeaSn8KeWoJEO03tE63hUi1MOLYmQFJOG0qVupvwTxAEAcj4ZpYhaiCHrtc7rAYkybaQWHAhIWlKlFIQFY89j5mttniWjU8uZKhu8LbyFJfiupwtsrB3BGxGd6VfGAtI3xHQ62/NYwKFvimvXMS3p7NkmAoezqeadbUDniz1+hpJ0Vd4umtB3O5SUB4qlBtCCPjVwjA9OZptTr28dIP6beyl2JNBRn9kcXEPkrf50q6ItRvtjmxbk97PaoSy+XU44i4UgcztgJB/xUQqYqoNMWOG1uUWesU9MXe4azu8m3zHz7A5HXxtNJCEIBGBgDzOd/Cua63lrs7kLt1pbEy5K4VSpLicJQnOQ2lPp+f0WdJXiyRJMm3WeGplosrcMl1WXHSkZyfAY5Ck6ToGfqa6x7uiU2iJcGW33VqOVJPAkEAdTkE5olDNTDUzie+vLulnI2OU6L7dbPY73p+4w4qW2323ZqkoHvLKkYQny3J/GuRd/1O7ObssVpxEniy93ZypS1bqKlfdAJ8sAVugMxr92kcMRrvYVjYDbQPwqKBhIz5qJPyrZJ1Hf4C3VyErFxmJ7iNEAweJRxx8PgOhPM/OhqOb2BIBPDpr/UtRkTymdduXa52NKLaHZDRkFh5TSSrvS2kDGB0Kyv6VzWe3XrSGg7ncnmVsz5XA22gDKmUZPvEDrudum1NvUl+vFieZ02zcXY6YqEoUiOeFS1ndRyPeO568/CnctVzsdmthUhcedLRxuq9odWvJOyA2VEk4xnY71bOpdqhBuBbu4ZQVUnKNnRttkSL6i9TlvRrfGWHXpD4I7xQOQkE7kk45Uvtw9Ji5Pyoc6Qbk6oqjqmqIbCyeYOOfhxeVdl0vNputtbtt91AxGnoXxBIRxd2cY4XCPdz+VJ950zL01aGrtZEi6ySch9DYcDKeikJyck/tb48OtLNN1sEAK6knX1yhgqBc6xwae05e2boJM+U6y2g5KQ9xKcPgemK1drjfHoeUDgfonf+Q140BetXXF1SLvDU5DxkSXUd0tJ8MYHF9NvGtXbLIbY0VICyd2XOXmAP61o3aU9kO7vmRrrqJYcu9z19JVxKVDY0qz7MqDYrfcVEkTOPbHw4O31GTRp663C33hg27dx5aWyhQylYJxgipOvGoIKLfcU26XHduERsrDfxDbnjocDPKse0V3puqqt7/nLKLo0UdSWNpDmPEGrO9nWSjTajzNmbB+VVnkTH5b633XFOurOVKUck1aDQbPdyLK2fiZsrAI8CUpP9a0ve9P/AMl95VDVu4xs9qEQrsOsGMY7tceYPQLAJ+i6r7yJwT4VafXVt9su06EBtdrW8wnzWEkp/FKaquM4G2KJBhxLyY+t/eVX1DcwJkEjONtsbV6bdLK0rSN0kKHyrFGB1FHrM8uB2fzTO0shXENlcQx4KAUPzpA1ToK83e8uTUTGZiVnCUuEo7pP7IG4xSd2H3ky7C3HUdw3wc/vIOP+Uinxq6Nd5luTHtiOJCj+l4F8KyPAeVKpBX2PCwJwZWHQ29JvftVL3tfONe7XOZ2a6JjxmognSH1qy5wksMnz8T4DbO9My2dp2o3ro0zNcYmx3VhJjORhhWTyTwjIPhzp86cs7lndeVfJLEWK8gp9mlPJw96pJxj8a3TLNarEk3MfZdhjr2S/HR3z6s/sE7JOPAGmU946BxdAOH57xTqFawN5nUL8fTC1yYN8cgyXACIa2xJ7zyCT7yfrimLB1Bfr3elT7ZY4TlwB96QzC4lA+JJJAPnzp2Xj7IY0wpWn21uvTCv2mWcqkJbQnicJUrcKIIGNvipv62vEiEqDZbEh6HADDbiG2CUrdUoZ97G5OCPnQVmw53y6dZQE5rtH1j9pt3ebb5TctobSWmQk4HiUc/n0rbL139p6cftNygM94ffbejpCMODqpPLfkSPGnVK1hI0ZpW0wp6VyLw+1xqSsk90nP3upI5YzuQd63HTNs19pmNdVMCDcH0k980nGSCR7w6jb1qboklabZkZgyX5xB0nc2NUaZl6WluIjzlJBjukYLoTukE9SMY9PSlbQekrrZdQPSJjRZbSypsniBCySMYx02zUd3a0XDTF1EeQhTUhB42nUclAclJP+sVIWlu0+M8y3E1A4GXxsJIHuL/ixyPny9KCgyNUUVcmX8zlkm2UZGuUIj64ujYGQXuPA/eSD/WnHoSO/dtC3yBFADynkEAnGRgZH0SaaOp7km6aouE1nCmnXjwK8UjYH6CnJ2Zajg2aXcW7i+mM062laVK5EpJ2Hng/hSaZU1zfQ3+8vQXnc/p97SunrhdJy0Ny32VRY7SVZIK9iT54zXbqDVn9mtHwrJBc47l7KhpxST+oHCM5/e8B0500dZarf1JdkrZJahR8hhs8/NR8z+FatMaXuWqpiu7/RxkK/SyXBkA+A8Vf6NEtTATT2cdPkyE4s2mmx6putmiPRbaENuyVDicSjicOBsB+PTrSrbrFrZyb9qxIktuUrJ754pCzn+PenvcIEHQVhbdtcYe1uOBsyHEhazsST6bchiuSfcLhrDSiJMIONPxXCJTDROVbbKT1I8vXwqygp9hmJYC9h7S1UnPhGrcbrqqFcGPtZotSyQlDxjNh0+SXOHn6U67PPscVt5MqDdrdcn0FC5k1pbju4xkOYOPlik035tPZ9NjXiK7cgh9EdpCz74Ks43O4IwcfIV2XBd8e0E1AFxQxcmJC2EpL3duSUIOAAcjKuW3XFNotljBJyvY+kplsbGNSP2WzrhPUmJc7fIjE571K1AhPmggnPz+dPZu2SdO2Bi1admrm92oqfLboW4FHwTn3U+QpP0zH1Tc7VcLLdG5iGH2VJbkyE4LS+g33KT86ZLOlNW2i8pEO1S2ZLSsodYTlHqFcsetCyjd9hSMXEajukU4WvraTPps3r2VRu2MH9WFfrB64/81HXbzcEtWIxsjiWEIx5lXEfwTUq2t2Y/ao7lwYEaWpA71vIPCrrgjpVd+3C8ImX1mKhfF7ynSB0A9xP5KrRXXBTp0rk58dcs/iXivifTL1ykWhSkqylZSfEVgEpOQTkdaM5rFVMcyAtaghA95R4QPM1bjSsXu9STgPhiR2oo/lSB/01WTQ9tF215ZYahltcpCnP4EniV+CTVptFJU9EnXBXOXJUoen+iaEDFXpr1J8h8maaOSO3cJ51o2WGrfdUJyqDISo/wnn+Q+tVa1vaE2LW91t6B+hQ+Vteba/fR/wqFXBusIXG1SIiv9qgpHkeh+tVv7WrQpyHab5wkOIBt0ryUjJbJ9Ukj+WmV13e0Hkwv4jI/a3lLYYqQPL3kYVnFZ2o3qpkkidkOoFWm/mOV+6oh5IJ542UPmk/hVmZczuLY7LZaXJKWy4htoZLm2QB61Su3ynrfcWJjJw4ysLHn4j5jarY9n9/YvGn2UIcCihAUjxKDy+h2oNnbdVynB/UfI9JrU46fVfSRO5ZNU6j1Et5yBMclvLypT7ZQhv5kYAFO/U+k75Jftlpt0VcmPCjJb75Z4UcZJK1ZJ9Kemsbw7arSgR1lD0hfAFDmkYycedMi4TdUWvTvDZoslybdF4S4ElSm0JG6t+RJUME+BpNQU1qGgbk6k/nOGEODHO1+VF7OrbCglTcy5rbcU4Ds2OMpyT5e4EgdcGlC/6maRarbMtrbLUmc13nfFscaEjbhB9dvlSDI7PrhdodoWiUxIfRGSxLc70LCHArJOeuyj8x504J7mlYqrZYHVrfchrQwkI8VEDCj5ncgcsUyoK2BlQhRkB+d0qmVDAtnOK/6WRqq2W7UEy4+xd1FAkr4OLKQScpHic1otvafa7b7Pbo9pkotzIDaXSsFYH7RT+J3pCvusLgz2iqhkEQIz4hiJjLa2shKklPI55/SpFiaA05CuPtjUIqWlXElC1lSEnxCTTEV2a9E5jJieMAkcZ1ajsMXVdjMV08KlDjYeA3bVjY+niKgWfa5FsnPQ5aCh9hRQsefiPKrK1F3a7Zgn2S8spwVH2d4jrtlJ/MfSj2+hiTeDUekinhIx5UcWelGD45rIKR8VcOHFzSul39T3lEVBLbCPffc/ZT5eZ5CpxP2fpiwKKWwxChNlXCgZIA/MnxpG7PLKm0aUYcKcPzAH3CeeD8I+Q/M06FoS4goWkKSoYIIyCK9DslDdU78TFk3kUT+1C1X7it063vR4i1DhfQ4FuNnorhxg+gNLcm1O6Y0k6/CmrfMh9t1bzWU4Rw7Y8ifzpTV2c6VblLmJtKSoZV3XGruyefw5x8uVMHRGo7pO16hEpwORpwWh1jHuIQEkgBPIBOMemayVaRv+6e02QI4Q0fCRyEdM3Wz1u0vbJjkVuTJkSShfeJ2WhHNWeh+HB8aQ9bW+NrGHa5drlpYkvoWsRnjw8eVnICuQUFZGDzpWmu2HtAt4tFpeMObCBdjJWnCVJ6j08eoxXPL0rCt1jtMGZcWItzShRKXl4SviUTsrkMH60NTfbsgWYADzyv4whhZs8pru8fVMbQlmcWZ4fiBTUptCzxkA4QpXD8QwOdLeg77dJxVFmtPuM8OUPLSfdPgSa86hlXi2/Z0pK3UYYSlakHKeMc89DmnhbZhn2yPK4eEuthRHgetFRAfaTZiCoGXMSyMNPmDNV4mCDannuIBWOFH8R5VUDVt0ReNUTJTZ4mgru2z+6nYH57n51OXbTq4W60LhMOYdcyyjB34iPeV8ht6mq5gADA6UdRt7VLcBkPeJqHCgXnn8TNArFZqTNJE7IoGLndryoe7CiFls/7x08I/wCELqylgh+wWGJHxhSWwVep3P51EnZlp8xtO2aCtH6W4um4ycjk3ybB/lBP89TYOVM2NcddqnBRh8dT7CayMFJV55/EKjbXWmU3P7QtCgEtXhvjYUeSJKd0/U7eiqknlSVqK2G52paG9n2j3jR68Q6fOtO3Ui9PGn1LmPceIylUmAOFtDlKXusrjvLZdQUONqKVpPNJBwQa81Inavp/gntaljN4ZuCuCUkDHdSQN8+AWPe9eKo6rCrBgGXQxDqUJUw3qROyfVjllvKITjvuLVxMhR2JPxI+fTzqPKylRSoKBIIOQQcEGgq08a20PDvl03KNeXbjuxrjHZlIQh1JGUFSQSnx9DTJ7TZcxxEK0xEvESeJbiWgSV4IAG3Temp2U9pDUhr2Gas98kfpB49O8H9R86mhCkrSHEEKChsodR61qR/1VI0z2W4/nIx7DCQRmJG2n7m5o1uBZJbSlPSHO9fyd2eMhKE+oG5rzprs3mtanF3u6khDDpcaaC+JTis7KV0AzvjenNO0qZ+sUXN5afZUJQvg+8paeQ9Ngac1DQ2diTvRkp7PdLciww+MbszRdrm6tjagcQfaGRlTf3VrHwqPmP8ALwpxUUVvChb2GsVCmv2jMJe0JPJ5t8Dg9Qsf506Ka3aO+GdCTwebnA2Pmsf5UFf/ABtfkZY1kFHyr2y0HX22z99QT9TivNemXO6kNufsLCvoc15caxssw02lllDSRhKEhIHkBXuvLaw40lxO4UAofOs162Jmab9o0ZabJe510itEvyycBXwtA7qSkeBO/wCFOCiqKgkEjSSRi3oWfpjV321CcactcdLr/CVcK0DgUQgjqM4GRSbc0zdeQG5zLCnpcFHduso2LiCchQHUg5BHpipdeaRIjuMup4m3ElCh4gjBpu6V0svTkqaS8l1pzCWiBg8O538+Vc2rspxLTT6De8YpFiTrDQapDmjYzUxpaVtKW1wupOQkK2BBrt1Bd49htC3ONtkhJ4egQBzV6Cu+fOZt0RUh9eEjkOqj4Cq1dqWv3L9Odt0Z3LIOHlJOxxyQPIdfE0dZ92oooe1bXkOfxIoAGNtPWNPV2oV6kvzsviUWEe4yFfs55nzJ3pDrGaKSqhRYTMzFjcwpb0fp86o1TEtpUUMKUXJDn7DKd1n6bepFIlTb2aaUet9hZ/RcFzv3Co5G7MUHIz/ERxegFDUfdqWtfl1PAQ6SY2AkqaPih4ybqWw2h490wjGyG07AD6AfKnTWmLGbiRGo7Q4W2khKR5Ct1dXZKG4pBDrx7zrGVHxteFFFFaouMXWGnIj6JTMpsqtl0HA+EjdlzmlweYO/1HWqyahsU3Td8kWuekB5lWyk/C4k/CtPiCN6uhJjNS4y2HkhTaxgiok7QdDG/Qfs8hKbpEBVb5Ctg8jmWVHz6eB8jXIq0ty2X0n7Hl4+saw3q34j0ld6Divb7LsaQ4w+0tp5pRQtCxhSVDmCPGtdLmWb4k2RAltyorpaeaPElQ6Gp+7NO1Fq4MpgzDwupGVteHipHiPEdKrzmvTL7sd5DzDimnUHiStJwQfEGgZDcOpsw/LHpHU6mHI5iXiZebkMpdaWlbahkKScg17qu2g+2B2EtEW7OpbUdu9P6tz+IfdPmNqnS06hg3dpBZcCXFDPASN/MHkRWultQY4Hyb17o0pcYkzEVaKKK2RcKjPtduw7mFaW1e8Ve0OgdAMhP9fpT21DqO36atipc50A8m2wfecV4D/PpUB3W5y73dZFwkKC3H1cWE8kjoB5AbVzturBU3Y1MJROPIFHPlWCUpOF+6fOgHi+A59K4cZJ90LdRdtHwnCrLrKe4c/iTt+IwfnTiqDNCas/sxdFImLPsMkgOgblB6LA/Pyqb2H2pTCH2HEutLAUlaDkKHiDXotkrCrTHMRRFpsrFZrBISCSQAOZNa5UzXHcblGtkcuvr3+6gc1Hypv6l1/arBEW4ZDR4du8UfdB8B1UfIVX3WvaTcNSPONRnHGYqtlKJwtweG3wp8hWCptV+zRzPPgPmMwhBd/LjF7tK7UXrnIdt9td2GULeQfdQOqUHqfFX0qKDWaxWdUw9SeMQ7lznCijFK2nLBN1Le2rdCQOJXvOOr2QygfEtR6Af9qOBrFrs80q3qC6rm3BJFot2HJHTvVfdaHmrG/gM1ZbStscSly7TE4lS/hTjAbb6JA6bY+QFNvRulYZYjRYbZTZberKSoYVKd+84r1/AYFSQNqPZae/cVj9I06nn7DzmsjdLg4nX4hR6UUV2IiFFFFSSFcN2tbN2hFhz3VDdCxzSfGu6igdFqKVYXBlglTcSDu0Ps/c1ItbrLaGNRMJxjkmegct/wBvHI9eRqCX2XYz62X21NOtqKVoWMKSRzBHQ1de72di7xe7cyhxO7bqeaTUS687P2tRPETC3AvqU4am4w1LA5Jc8/BXPxrkujUThfTgfY9evGMZBUGJNeI+JX6iu272e4WG5u266RXIspr4kLHMdCDyIPiNq4qo5TNCluxavu+nlBMR/jj5yWHd0fLqPlSHWRQsquLMLy1YqbqZPel+3CKpCGri4WF8uF85T8nB/WpMtutLTcWkrDvdpVyVniQf5hVOcV0RLhMgOccSW9HV4trKfyoV3tP/ABtlyOf9x4rK31jyl0FR7RdHEvrZhzFgYC1JSsgeG9dLcOMyMNRmWwP2WwKqPC7R9QQgOJ5qTjq63v8AUYNL0XttvTIAVHUB/u5Kh+BBpg2mqPqp37j82hftnRrd4lmXocWQnhfisujwW2FfnXpEVhtPChhpKR0CABVdUdutwx7yJg//ACpP/TWF9u9wIIDMpXq+lP5Jq/1h/wCkft8yYU/kPv8AEsM9bID/AOugxnP42kn8xWj2u0WdnukuRorYOe7bwN/4RVaLh2w3qZkIZCQf715a/wANqb03W+oJqSk3BTCD91gBH4jf8aH9TWP0oB3n4+ZP2hqb+EsvfO0qz2doqU6hPgp5XCD6J5moj1V21SZ/EzbgpxPRbg4Gx6I5n51FC3XHVlbq1OLPNSjkn515pbK9T/K1+mggmtb6Bb1nZcbpNu8kyJ0hb7nQqOyfIDkPlXJWBWaYAALCZySTcwoope0tpC56smKbhpSzGZ3kS3dmmR5nqfBI3NSQC+QnFYrHP1FdmrdbWe9kOb77JQkc1KPRI6mp/wBF6KjxIJtFuUVsZCrhcMYMlQ+6nwSOg+Zrfo7RcWLbzbrQ2pmAoj2qcsYdlqHTyT4J5Drk1JcOGxAiojxmw20gYAH51VKkdqNv9OJ/l0HTmeM1gChmfq9P7nqNHaiRkMMIDbTY4UpHQVtoortgACwiNYUUUVckKKKKkkKKKKkkK5p0CPcYxYkthaDy8QfEHpXTRQsoYWYZSwSDcSOdV6Njy7d7Jd4ZuduRnun0bSIvmlXh5cjUIao7MbnY2XJ9tX9sWpO5eZT+kaH+8RzHqMirakZGDSDO0uy48ZVudMCVzyj4Veorm1Nmen/jzXlxHcfY+caSlT6sjz+ZTHnWRVhtVdnFoua1uXa2KtUxX/1C3pHdrPitv4T8sGoyvXZNqK3JW/bUtXyIN+8hHLgH7zZ94fLNZ1ZWNhryOR8op6LJnwjHrFe3WnGHlNPNracScKQsFKh6g15oomY261JXZboy1aljT/tRI7+Yw8zbEKJGXEJBU5t+yVJHzPhUdxWEyJLbK5DUcLVguOnCE+ZPhUqWvWVvsPaHY7dbhZpFotyUMNT1YCw2ofpV94SOElRWcHyFNpAXuZYkTOMvMurbdTwuIJSpPgRsRUg9lGnrPqP7cZvFralOQoapTCy44ncbcJCVAEcvOkbtLhxWNfXCTa5cWXb5zhksrjPJcSCrdSTg7YUTzpydis+JZ7xd5tzuEO3x3ISo6VvvpQSsqBGATk7A74q0FqljLGs0uWWxXfsPe1T9ksWu5xZYYbVHUsNyRlO3CpR3wo8v2ajcHPTFKt8vN1uDwi3G6uT0xTwow93jQ804935ikqgcgmVPQoorogW6bdJSYtvhvzH1cm2WytX0FBrKnPXtttbziW20KcWs4SlIySfADrUiWbseuLnC9qKa1aGefcJw9IV/KDhPzPyqU9KaEYtCQbBbRBChhVwl+/IWPI/d/lA9aEsAcIzPIa/14xy0WYXOQkYab7KXQWpmqFORWlYKLe0f/Uu+HF/dj138hU12PSfHFjtyIqLfbWP1NvZGAPNXUnxJ3NL9q09Dtau9SC9JPxPObqPp4Uq1op7I1TOvp/H5PHu0jcS08qevP4nlttDLQbbQEISMBKRgAV6oorqAWyETCiiipJCiiipJCiiipJCiiipJCiiipJCiiipJMKSlYKVAEHmDypGmaWt8hfesBcN7mFsHh/ClqilVKNOqLOLwldlzUxjXnR8qejguMO339kcvaWgHQPJXMfWmJdeyjTTpUTbrtZFnqysPNj5LGfxqdKOlZDsRH0OR35+uf3h7xW+pfaVlkdiocUTA1XEUOiZcdbR+o4hXA92KakR+pl2iUP3JgH/MBVoXrfDkfrorK/NSAa4nNM2d05VBQP4SR+Rof09Ycj5j5lWpnmJV93sg1k38FvjOeaJrP/8AVDfY5rV344MRoeK5rX9FVZs6Ss+ciMoejiv86yNKWj/2yj6uK/zqhQq8h5/1Kw0+ZlcGexa/bCRcrNFHXilcZHySk0qxOxeAlQ+0dUhZ6ohRSo/4lEflVgG9N2ho5TAbJ/eyr867WYcaP+pjtN/woAqxs1U8h5n4l2pDmZEFo7KNNxikxrBMuix/tLg8Qj/CnhFPq36WlMxhHS5GtkX+4gtBA+ZGP6066KYNjB+tifsPtL3gH0i0TIGn7dbyFNMBbg++57x/7Up4oorUlNKYsgtAZixuTCiiimQYUUUVJIUUUVJIUUUdKkk//9k="><h1>SRM AP Smart Notice Board</h1><p class="brand">SRM AP Skill Development and Embedded Systems</p><p>Embedded Full Stack and IoT Analyst · Digital Campus Announcements</p>
+<nav class="site-nav" aria-label="Main navigation"><a href="/">Admin Login</a><a class="user-link" href="/notices">User Display</a></nav>
+<div class="live-panel" aria-live="polite"><div class="live-item">📍 Place: <strong id="livePlace">Mangalagiri, Andhra Pradesh</strong></div><div class="live-item">📅 Day: <strong id="liveDay">—</strong></div><div class="live-item">🗓 Date: <strong id="liveDate">—</strong></div><div class="live-item">🕒 Time: <strong id="liveTime">—</strong></div><div class="live-item">🌡 Temperature: <strong id="liveTemp">—</strong></div><div class="live-item">🌦 Weather: <strong id="liveWeather">Loading…</strong></div><div class="live-item">🌫 Live AQI: <strong id="liveAqi">—</strong></div></div></header>
+<div id="introSplash" class="intro-splash"><div class="intro-inner"><div id="introLogoSlot"></div><h1>SRM AP Skill Development</h1><p class="training-title">Embedded Full Stack and IoT Analyst</p><p>SRM University-AP · Smart Notice Board</p><div class="developers"><strong>Developed by</strong><br>P.M. Shoaib Khan · G. Indra Nag · M. Jayanth Siva Srinivas<br>P. Joshi · Sk. Imran<br><br><strong>Project guidance by</strong><br>Anil Dasaroju<br><br><strong>Special thanks to</strong><br>A BalaMurgan — Head, Skill Development<br>A Sagar — Manager, Skill Development</div></div></div>
+)HTML";
+
+const char PAGE_FOOT[] PROGMEM = R"HTML(<style>
+.sx-wrap{max-width:1540px;width:calc(100% - 28px);margin:18px auto 0}
+.sx-tiles{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:14px}
+.sx-tile{border-radius:20px;padding:18px 14px;min-height:120px;color:#1e293b;border:2px solid;box-shadow:0 10px 28px #43140724}
+.sx-tile span{display:block;font-size:13px;font-weight:700}
+.sx-tile strong{display:block;font-size:clamp(24px,3vw,32px);font-weight:900;margin-top:8px}
+.sx-tile small{display:block;margin-top:6px;font-size:12px;opacity:.85}
+.sx-t1{background:linear-gradient(145deg,#8ec5ff,#c9e6ff);border-color:#3988e8}
+.sx-t2{background:linear-gradient(145deg,#8cf0b3,#c8ffda);border-color:#27b765}
+.sx-t3{background:linear-gradient(145deg,#d8b4fe,#f0d9ff);border-color:#a855f7}
+.sx-t4{background:linear-gradient(145deg,#ffad66,#ffd2a3);border-color:#f97316}
+.sx-gauges{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+.gauge-card{background:linear-gradient(145deg,#fff,#fff7ed);color:#431407;border:2px solid #fdba74;border-radius:20px;padding:16px;box-shadow:0 10px 28px #43140724;text-align:center}
+.gauge-card h3{margin:0 0 4px;font-size:14px;font-weight:800;color:#9a3412}
+.gauge-card svg{width:100%;max-width:300px;height:auto;display:block;margin:6px auto 0}
+.g-needle{transition:transform 1.2s cubic-bezier(.2,.8,.2,1);transform-origin:100px 100px}
+.g-needle line{stroke:#431407}.gauge-card circle:first-of-type{fill:#431407}
+.g-value{font-size:clamp(24px,3vw,32px);font-weight:900;margin-top:2px}
+.g-label{display:inline-block;margin-top:6px;padding:4px 12px;border-radius:999px;font-size:13px;font-weight:800;color:#111827;background:#94a3b8}
+.g-sub{margin-top:9px;font-size:12px;color:#9a3412;line-height:1.5}
+.g-scale{fill:#9a3412;font-size:9px}
+@media(max-width:1200px){.sx-tiles{grid-template-columns:repeat(2,minmax(0,1fr))}.sx-gauges{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:700px){.sx-wrap{width:calc(100% - 16px)}.sx-gauges{grid-template-columns:1fr}}
+</style>
+<script>
+(function(){
+  function pt(f,r){var a=Math.PI*(1-f);return [100+r*Math.cos(a),100-r*Math.sin(a)];}
+  function arc(f1,f2,r){var p=pt(f1,r),q=pt(f2,r);return 'M'+p[0].toFixed(2)+' '+p[1].toFixed(2)+' A'+r+' '+r+' 0 0 1 '+q[0].toFixed(2)+' '+q[1].toFixed(2);}
+  var GAS={min:0,max:100,zones:[[40,'#22c55e','Normal'],[60,'#facc15','Elevated'],[80,'#fb923c','High'],[100,'#ef4444','Danger']]};
+  var CO2={min:350,max:1000,zones:[[450,'#22c55e','Normal'],[600,'#facc15','Slightly elevated'],[800,'#fb923c','High'],[1000,'#ef4444','Very high']]};
+  var AQI={min:0,max:300,zones:[[50,'#22c55e','Good'],[100,'#facc15','Moderate'],[150,'#fb923c','Unhealthy (sensitive)'],[200,'#ef4444','Unhealthy'],[300,'#a21caf','Very unhealthy']]};
+  function svg(cfg,id){
+    var s='<svg viewBox="0 0 200 124" role="img" aria-label="gauge">',prev=cfg.min;
+    cfg.zones.forEach(function(z){var f1=(prev-cfg.min)/(cfg.max-cfg.min),f2=(z[0]-cfg.min)/(cfg.max-cfg.min);s+='<path d="'+arc(f1,f2,80)+'" fill="none" stroke="'+z[1]+'" stroke-width="16"/>';prev=z[0];});
+    s+='<text class="g-scale" x="20" y="116" text-anchor="middle">'+cfg.min+'</text><text class="g-scale" x="180" y="116" text-anchor="middle">'+cfg.max+'+</text>';
+    s+='<g class="g-needle" id="'+id+'Needle" style="transform:rotate(-90deg)"><line x1="100" y1="100" x2="100" y2="34" stroke="#f8fafc" stroke-width="3" stroke-linecap="round"/></g><circle cx="100" cy="100" r="7" fill="#f8fafc"/><circle cx="100" cy="100" r="3" fill="#111827"/></svg>';
+    return s;
+  }
+  function card(id,title,cfg,sub){return '<div class="gauge-card"><h3>'+title+'</h3>'+svg(cfg,id)+'<div class="g-value" id="'+id+'Value">--</div><span class="g-label" id="'+id+'Label">Loading…</span><div class="g-sub" id="'+id+'Sub">'+sub+'</div></div>';}
+  function setG(id,cfg,val,unit){
+    var v=document.getElementById(id+'Value'),l=document.getElementById(id+'Label'),n=document.getElementById(id+'Needle');
+    if(!v)return;
+    if(val==null||isNaN(val)){v.textContent='--';l.textContent='Unavailable';l.style.background='#94a3b8';l.style.color='#111827';n.style.transform='rotate(-90deg)';return;}
+    val=Number(val);var f=Math.max(0,Math.min(1,(val-cfg.min)/(cfg.max-cfg.min)));n.style.transform='rotate('+(-90+180*f)+'deg)';
+    var z=cfg.zones[cfg.zones.length-1];for(var i=0;i<cfg.zones.length;i++){if(val<=cfg.zones[i][0]){z=cfg.zones[i];break;}}
+    v.textContent=Math.round(val)+' '+unit;l.textContent=z[2];l.style.background=z[1];l.style.color=z[1]==='#a21caf'?'#fff':'#111827';
+  }
+  function mount(){
+    if(document.getElementById('sxWrap'))return;
+    var d=document.createElement('div');d.id='sxWrap';d.className='sx-wrap';
+    d.innerHTML=
+     '<div class="sx-tiles">'+
+     '<div class="sx-tile sx-t1"><span>🌡️ Board temperature</span><strong id="bTemp">-- °C</strong><small>DHT11 sensor</small></div>'+
+     '<div class="sx-tile sx-t2"><span>💧 Board humidity</span><strong id="bHum">-- %</strong><small>DHT11 sensor</small></div>'+
+     '<div class="sx-tile sx-t3"><span>🧪 Gas sensor (raw)</span><strong id="bGas">-- / 4095</strong><small>MQ-2 analog level</small></div>'+
+     '<div class="sx-tile sx-t4"><span>📶 Board status</span><strong id="bStat" style="font-size:22px">Waiting…</strong><small id="bAge">No data yet</small></div>'+
+     '</div><div class="sx-gauges">'+
+     card('gGas','🧪 Gas level (board MQ-2)',GAS,'Relative reading from your MQ-2 sensor, not calibrated ppm')+
+     card('gCo2','🌫️ CO₂ level (campus area)',CO2,'Online model data · normal outdoor air ≈ 420 ppm')+
+     card('gAqi','🏭 Pollution (AQI)',AQI,'Loading PM2.5 / PM10…')+
+     '</div>';
+    var h=document.querySelector('header');
+    if(h&&h.parentNode)h.parentNode.insertBefore(d,h.nextSibling);else document.body.insertBefore(d,document.body.firstChild);
+  }
+  async function board(){
+    try{
+      var r=await fetch('/sensor',{cache:'no-store'});if(!r.ok)throw 0;var j=await r.json();
+      var ok=j.valid&&j.age<30000;
+      document.getElementById('bTemp').textContent=ok?j.temp.toFixed(1)+' °C':'-- °C';
+      document.getElementById('bHum').textContent=ok?Math.round(j.hum)+' %':'-- %';
+      document.getElementById('bGas').textContent=ok?j.gas+' / 4095':'-- / 4095';
+      document.getElementById('bStat').textContent=ok?'🟢 Online':'🔴 No data';
+      document.getElementById('bAge').textContent=j.valid?'Updated '+Math.round(j.age/1000)+' s ago':'Sensor not read yet';
+      setG('gGas',GAS,ok?j.pct:null,'%');
+    }catch(e){
+      document.getElementById('bStat').textContent='🔴 Offline';document.getElementById('bAge').textContent='Cannot reach ESP32';setG('gGas',GAS,null,'%');
+    }
+  }
+  async function air(){
+    var sub=document.getElementById('gAqiSub');
+    try{
+      var u='https://air-quality-api.open-meteo.com/v1/air-quality?latitude=16.4308&longitude=80.5687&current=us_aqi,pm2_5,pm10,carbon_dioxide&timezone=Asia%2FKolkata';
+      var r=await fetch(u);if(!r.ok)throw 0;var j=await r.json(),c=j.current||{};
+      setG('gCo2',CO2,c.carbon_dioxide,'ppm');setG('gAqi',AQI,c.us_aqi,'AQI');
+      if(sub)sub.textContent=(c.pm2_5!=null?'PM2.5: '+c.pm2_5+' µg/m³':'')+(c.pm10!=null?' · PM10: '+c.pm10+' µg/m³':'');
+    }catch(e){setG('gCo2',CO2,null,'ppm');setG('gAqi',AQI,null,'AQI');if(sub)sub.textContent='Air-quality service could not be reached';}
+  }
+  mount();board();air();setInterval(board,3000);setInterval(air,600000);
+})();
+</script>
+<footer><div class="brandline">SRM AP Smart Notice Board · Powered by ESP32 and Supabase</div><div class="credit">Project guidance by <b>Anil Dasaroju</b> · Special thanks to <b>A BalaMurgan</b> (Head-Skill Development) and <b>A Sagar</b> (Manager-Skill Development).</div><div class="credit">Project developed by <b>P.M Shoaib Khan</b>, <b>G. Indra nag</b>, <b>M. Jayanth siva srinivas</b>, <b>P. Joshi</b>, <b>Sk. Imran</b>.</div></footer>
+<script>
+// Intro screen: every word floats in one after another; the screen then stays long enough to read.
+// Tune the timing here (milliseconds):
+(function(){
+  const WORD_STEP_MS=140;        // gap between one word and the next
+  const LOGO_MS=700;             // time the logo gets before the first word
+  const WORD_ANIM_MS=800;        // length of each word's float animation
+  const READ_HOLD_MS=2000;       // minimum extra time to read after the last word
+  const PER_WORD_HOLD_MS=0;      // extra reading time added for every word on the screen
+  const ONCE_PER_SESSION=true;   // true = full intro only on first visit per browser session
+  const splash=document.getElementById('introSplash');
+  if(!splash)return;
+  let seen=false;
+  try{seen=ONCE_PER_SESSION&&sessionStorage.getItem('introSeen')==='1';}catch(e){}
+  try{if(window.matchMedia('(prefers-reduced-motion: reduce)').matches)seen=true;}catch(e){}
+  if(seen){splash.style.display='none';return;}
+  const logo=document.querySelector('header .logo');
+  const slot=document.getElementById('introLogoSlot');
+  if(logo&&slot){const clone=logo.cloneNode(true);clone.removeAttribute('style');slot.appendChild(clone);slot.classList.add('reveal-line');slot.style.animationDelay='0.1s';}
+  const intro=splash.querySelector('.intro-inner');
+  let n=0;
+  function wrap(node){
+    if(node.nodeType===3){
+      const frag=document.createDocumentFragment();
+      node.textContent.split(/(\s+)/).forEach(function(p){
+        if(!p)return;
+        if(/^\s+$/.test(p)){frag.appendChild(document.createTextNode(' '));return;}
+        const sp=document.createElement('span');sp.className='w';sp.textContent=p;
+        sp.style.animationDelay=(LOGO_MS+n*WORD_STEP_MS)+'ms';n++;frag.appendChild(sp);
+      });
+      node.parentNode.replaceChild(frag,node);
+    }else if(node.nodeType===1&&node.id!=='introLogoSlot'){
+      Array.from(node.childNodes).forEach(wrap);
+    }
+  }
+  if(intro)wrap(intro);
+  const totalMs=LOGO_MS+n*WORD_STEP_MS+WORD_ANIM_MS+READ_HOLD_MS+n*PER_WORD_HOLD_MS;
+  let timer=null;
+  function finish(){
+    if(timer){window.clearTimeout(timer);timer=null;}
+    splash.classList.add('done');
+    try{sessionStorage.setItem('introSeen','1');}catch(e){}
+  }
+  const skip=document.createElement('button');
+  skip.type='button';skip.className='skip-intro';skip.textContent='Skip intro';skip.onclick=finish;
+  splash.appendChild(skip);
+  timer=window.setTimeout(finish,totalMs);
+})();
+
+// Live local date/time plus weather and air quality for Mangalagiri, Andhra Pradesh.
+// Uses Open-Meteo public APIs; an internet connection is required for temperature/AQI.
+const LIVE_LAT=16.4308, LIVE_LON=80.5687;
+const LIVE_PLACE='Mangalagiri, Andhra Pradesh';
+const FMT_DAY=new Intl.DateTimeFormat('en-IN',{timeZone:'Asia/Kolkata',weekday:'long'});
+const FMT_DATE=new Intl.DateTimeFormat('en-IN',{timeZone:'Asia/Kolkata',day:'2-digit',month:'short',year:'numeric'});
+const FMT_TIME=new Intl.DateTimeFormat('en-IN',{timeZone:'Asia/Kolkata',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:true});
+const EL_DAY=document.getElementById('liveDay'),EL_DATE=document.getElementById('liveDate'),EL_TIME=document.getElementById('liveTime'),EL_PLACE=document.getElementById('livePlace');
+function updateLocalClock(){
+  if(document.hidden)return;
+  const now=new Date();
+  if(EL_DAY)EL_DAY.textContent=FMT_DAY.format(now);
+  if(EL_DATE)EL_DATE.textContent=FMT_DATE.format(now);
+  if(EL_TIME)EL_TIME.textContent=FMT_TIME.format(now);
+  if(EL_PLACE)EL_PLACE.textContent=LIVE_PLACE;
+}
+function aqiDescription(aqi){if(aqi==null||Number.isNaN(Number(aqi)))return 'Unavailable';const n=Number(aqi);let label=n<=50?'Good':n<=100?'Moderate':n<=150?'Unhealthy for sensitive groups':n<=200?'Unhealthy':n<=300?'Very unhealthy':'Hazardous';return n+' ('+label+')';}
+async function updateLiveEnvironment(){
+  const temp=document.getElementById('liveTemp'),aqi=document.getElementById('liveAqi'),weather=document.getElementById('liveWeather');
+  try{
+    const url='https://api.open-meteo.com/v1/forecast?latitude='+LIVE_LAT+'&longitude='+LIVE_LON+'&current=temperature_2m,weather_code,is_day&timezone=Asia%2FKolkata';
+    const r=await fetch(url);if(!r.ok)throw new Error('weather request failed');const j=await r.json();
+    if(temp)temp.textContent=j.current&&j.current.temperature_2m!=null?j.current.temperature_2m+' '+(j.current_units?.temperature_2m||'°C'):'Unavailable';
+    if(weather&&j.current){const code=Number(j.current.weather_code);let label=code===0?'Clear sky':[1,2,3].includes(code)?'Partly cloudy':[45,48].includes(code)?'Fog':[51,53,55,56,57].includes(code)?'Drizzle':[61,63,65,66,67,80,81,82].includes(code)?'Rain':[71,73,75,77,85,86].includes(code)?'Snow':[95,96,99].includes(code)?'Thunderstorm':'Current conditions';weather.textContent=(j.current.is_day===0?'Night · ':'')+label;document.body.dataset.weather=label.toLowerCase();document.body.dataset.day=j.current.is_day===0?'night':'day';}
+  }catch(e){if(temp)temp.textContent='Unavailable';}
+  try{
+    const url='https://air-quality-api.open-meteo.com/v1/air-quality?latitude='+LIVE_LAT+'&longitude='+LIVE_LON+'&current=us_aqi,pm2_5,pm10&timezone=Asia%2FKolkata';
+    const r=await fetch(url);if(!r.ok)throw new Error('air-quality request failed');const j=await r.json();
+    if(aqi){const v=j.current&&j.current.us_aqi;aqi.textContent=aqiDescription(v);aqi.title=j.current?'PM2.5: '+j.current.pm2_5+' µg/m³ · PM10: '+j.current.pm10+' µg/m³':'AQI unavailable';}
+  }catch(e){if(aqi)aqi.textContent='Unavailable';}
+}
+updateLocalClock();setInterval(updateLocalClock,1000);updateLiveEnvironment();setInterval(updateLiveEnvironment,600000);
+// Dynamic background responds to local time and current weather.
+(function(){function theme(){const h=Number(new Intl.DateTimeFormat('en-GB',{timeZone:'Asia/Kolkata',hour:'2-digit',hourCycle:'h23'}).format(new Date()));const w=(document.body.dataset.weather||'').toLowerCase();let bg;if(w.includes('rain')||w.includes('thunder')||w.includes('drizzle'))bg='linear-gradient(135deg,#172554,#334155,#0f172a)';else if(h>=5&&h<10)bg='linear-gradient(135deg,#fef3c7,#fed7aa,#e0f2fe)';else if(h>=10&&h<16)bg='linear-gradient(135deg,#dbeafe,#fef3c7,#ffedd5)';else if(h>=16&&h<19)bg='linear-gradient(135deg,#7c2d12,#fb923c,#4c1d95)';else bg='linear-gradient(135deg,#020617,#172554,#111827)';document.body.style.backgroundImage=bg;}theme();setInterval(theme,60000);})();
+</script></body></html>)HTML";
+
+String supabaseConfigJs() {
+  String s = "const SB_URL='" + String(SUPABASE_URL) + "';\n";
+  s += "const SB_KEY='" + String(SUPABASE_ANON_KEY) + "';\n";
+  return s;
+}
+
+String pageLogin() {
+  String h = FPSTR(PAGE_HEAD);
+  h += R"HTML(<main class="wrap"><section class="card" style="max-width:520px;margin:30px auto"><h2>Admin Login</h2>
+<p class="small">Sign in with the admin email and password configured in Supabase Authentication.</p>
+<div id="status" class="status">Enter your credentials to continue.</div>
+<label for="email">Admin Email</label><input id="email" type="email" autocomplete="username" value="mohammadshoaib0207@gmail.com" placeholder="Admin email">
+<label for="password">Password</label><input id="password" type="password" autocomplete="current-password" placeholder="Password">
+<div class="row" style="margin-top:18px"><button onclick="login()">Sign In</button><button class="secondary" onclick="location.href='/notices'">User Display</button></div>
+</section></main><script>
+)HTML";
+  h += supabaseConfigJs();
+  h += R"JS(
+async function login(){const status=document.getElementById('status');const email=document.getElementById('email').value.trim().toLowerCase();if(email!=='mohammadshoaib0207@gmail.com'){status.textContent='Access denied: use the registered admin email.';return;}status.textContent='Signing in…';try{const r=await fetch(SB_URL+'/auth/v1/token?grant_type=password',{method:'POST',headers:{'Content-Type':'application/json','apikey':SB_KEY},body:JSON.stringify({email:email,password:document.getElementById('password').value})});const d=await r.json();if(!r.ok)throw new Error(d.msg||d.message||d.error_description||'Login failed');sessionStorage.setItem('sb_access_token',d.access_token);sessionStorage.setItem('sb_refresh_token',d.refresh_token||'');sessionStorage.setItem('sb_user',JSON.stringify(d.user||{}));location.href='/admin';}catch(e){status.textContent='Login failed: '+e.message;}}
+</script>)JS";
+  h += FPSTR(PAGE_FOOT);
+  return h;
+}
+
+String pageAdmin() {
+  String h = FPSTR(PAGE_HEAD);
+  h += R"HTML(<main class="wrap"><div class="tabs"><button class="active" onclick="showTab('publish',this)">Publish Notice</button><button onclick="showTab('manage',this)">Manage Notices</button><button class="secondary" onclick="window.open('/notices','_blank','noopener')">Open Public View in New Page</button><button class="danger" onclick="logout()">Log Out</button></div>
+<section id="publish" class="card"><h2>Admin Dashboard</h2><p class="small">Create a notice for the public notice board.</p><div id="status" class="status">Checking login…</div>
+<label for="title">Notice Title</label><input id="title" maxlength="160" placeholder="e.g. Important Announcement">
+<label for="message">Notice Message</label><textarea id="message" maxlength="10000" placeholder="Enter the complete notice here…"></textarea>
+<label for="imageFile">Attach an image (optional)</label><input id="imageFile" type="file" accept="image/*">
+<label for="documentFile">Attach a document or file (optional)</label><input id="documentFile" type="file" accept=".pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.txt,.zip,.csv">
+<label for="videoFile">Attach a video (optional, maximum 50 MB)</label><input id="videoFile" type="file" accept="video/*,.mp4,.webm,.mov">
+
+<p class="small">Choose a video file from your device. It uploads directly to the public Supabase Storage bucket named notice-files (maximum 50 MB). Configure its upload limit and policies in Supabase.</p>
+<div class="row" style="margin-top:16px"><button onclick="publishNotice()">Publish Notice</button><button class="secondary" onclick="clearForm()">Clear</button></div></section>
+<section id="manage" class="card hidden"><h2>Published Notices</h2><div id="listStatus" class="status">—</div><div id="adminList"></div></section></main><script>
+)HTML";
+  h += supabaseConfigJs();
+  h += R"JS(
+const token=sessionStorage.getItem('sb_access_token');if(!token){location.replace('/');}
+function authHeaders(){return {'Content-Type':'application/json','apikey':SB_KEY,'Authorization':'Bearer '+(sessionStorage.getItem('sb_access_token')||SB_KEY),'Prefer':'return=representation'}}
+function showTab(id,btn){document.querySelectorAll('main .card').forEach(x=>x.classList.add('hidden'));document.getElementById(id).classList.remove('hidden');document.querySelectorAll('.tabs button').forEach(x=>x.classList.remove('active'));btn.classList.add('active');if(id==='manage')loadAdminNotices();}
+function logout(){sessionStorage.removeItem('sb_access_token');sessionStorage.removeItem('sb_refresh_token');sessionStorage.removeItem('sb_user');location.href='/';}
+function clearForm(){document.getElementById('title').value='';document.getElementById('message').value='';document.getElementById('imageFile').value='';document.getElementById('documentFile').value='';document.getElementById('videoFile').value='';}
+async function uploadAttachment(file){if(!file)return '';const safeName=file.name.replace(/[^a-zA-Z0-9._-]/g,'_');const path=Date.now()+'_'+Math.random().toString(36).slice(2)+'_'+safeName;const endpoint=SB_URL+'/storage/v1/object/notice-files/'+path;const r=await fetch(endpoint,{method:'POST',headers:{'apikey':SB_KEY,'Authorization':'Bearer '+token,'Content-Type':file.type||'application/octet-stream','x-upsert':'false'},body:file});if(!r.ok)throw new Error('File upload failed ('+file.name+'): '+await r.text());return SB_URL+'/storage/v1/object/public/notice-files/'+path;}
+async function publishNotice(){const title=document.getElementById('title').value.trim(),message=document.getElementById('message').value.trim(),imageFile=document.getElementById('imageFile').files[0],documentFile=document.getElementById('documentFile').files[0],videoFile=document.getElementById('videoFile').files[0],status=document.getElementById('status');if(!title||(!message&&!imageFile&&!documentFile&&!videoFile)){status.textContent='Enter a title and add a message or attachment.';return;}if(imageFile&&imageFile.size>5*1024*1024){status.textContent='Image is too large. Maximum size is 5 MB.';return;}if(documentFile&&documentFile.size>25*1024*1024){status.textContent='File is too large. Maximum size is 25 MB.';return;}if(videoFile&&videoFile.size>50*1024*1024){status.textContent='Video is too large. Maximum size is 50 MB.';return;}status.textContent='Publishing…';try{const image_url=await uploadAttachment(imageFile);const document_url=await uploadAttachment(documentFile);const video_url=await uploadAttachment(videoFile);const r=await fetch(SB_URL+'/rest/v1/'+NOTICE_TABLE,{method:'POST',headers:authHeaders(),body:JSON.stringify({title,message,image_url,document_url,video_url})});const body=await r.text();if(!r.ok)throw new Error(body);status.textContent='Notice published successfully! Public View updates automatically.';clearForm();}catch(e){status.textContent='Publish failed: '+e.message+'\nMake sure the video_url column exists, Storage upload policies are enabled, and the bucket limit permits your file size.';}}
+async function loadAdminNotices(){const st=document.getElementById('listStatus'),box=document.getElementById('adminList');st.textContent='';box.innerHTML='';try{const r=await fetch(SB_URL+'/rest/v1/'+NOTICE_TABLE+'?select=id,title,message,image_url,document_url,video_url,created_at&order=created_at.desc&limit=100',{headers:authHeaders()});const d=await r.json();if(!r.ok)throw new Error(JSON.stringify(d));st.textContent=d.length+' notice(s)';d.forEach(n=>{const el=document.createElement('article');el.className='notice';const title=document.createElement('h3');title.textContent=n.title||'Untitled';const p=document.createElement('p');p.textContent=n.message||'';el.append(title,p);if(n.image_url){const im=document.createElement('img');im.src=n.image_url;im.alt='Notice attachment';im.style.cssText='display:block;max-width:100%;max-height:420px;margin-top:12px;border-radius:8px';el.appendChild(im);}if(n.document_url){const a=document.createElement('a');a.href=n.document_url;a.target='_blank';a.rel='noopener';a.textContent='Open attached document';a.style.display='inline-block';a.style.marginTop='12px';el.appendChild(a);}if(n.video_url){const v=document.createElement('video');v.src=n.video_url;v.controls=true;v.style.cssText='display:block;width:100%;max-width:720px;max-height:420px;margin-top:12px;border-radius:12px';el.appendChild(v);const dl=document.createElement('a');dl.href=n.video_url+'?download='+encodeURIComponent('notice-video');dl.textContent='Download video';dl.style.display='inline-block';dl.style.marginTop='8px';el.appendChild(dl);}const meta=document.createElement('div');meta.className='meta';meta.textContent=n.created_at||'';const del=document.createElement('button');del.className='danger';del.textContent='Delete';del.style.marginTop='12px';del.onclick=()=>deleteNotice(n.id);el.append(title,p,meta,del);box.appendChild(el);});}catch(e){st.textContent='Could not load: '+e.message;}}
+async function deleteNotice(id){if(!confirm('Delete this notice?'))return;try{const r=await fetch(SB_URL+'/rest/v1/'+NOTICE_TABLE+'?id=eq.'+encodeURIComponent(id),{method:'DELETE',headers:authHeaders()});if(!r.ok)throw new Error(await r.text());loadAdminNotices();}catch(e){alert('Delete failed: '+e.message);}}
+const NOTICE_TABLE='notices';
+document.getElementById('status').textContent='Signed in. Publish notices below.';
+</script>)JS";
+  h += FPSTR(PAGE_FOOT);
+  return h;
+}
+
+String pageNotices() {
+  String h = FPSTR(PAGE_HEAD);
+  h += R"HTML(<main class="wrap"><section class="card"><div class="row"><div><h2>Public Notice Board</h2><p class="small">Latest campus announcements</p></div><div style="text-align:right"><button onclick="loadNotices()">Refresh</button><button class="secondary" onclick="window.open('/notices','_blank','noopener')">Open in New Page</button><button class="secondary" onclick="location.href='/'">Admin Login</button></div></div><div id="status" class="status" aria-live="polite"></div><div id="notices"></div></section></main><script>
+)HTML";
+  h += supabaseConfigJs();
+  h += R"JS(
+const NOTICE_TABLE='notices';
+async function loadNotices(){const st=document.getElementById('status'),box=document.getElementById('notices');st.textContent='';try{const r=await fetch(SB_URL+'/rest/v1/'+NOTICE_TABLE+'?select=id,title,message,image_url,document_url,video_url,created_at&order=created_at.desc&limit=100',{headers:{'apikey':SB_KEY,'Authorization':'Bearer '+SB_KEY}});const d=await r.json();if(!r.ok)throw new Error(JSON.stringify(d));box.innerHTML='';st.textContent=d.length?d.length+' notice(s) available':'No notices have been published yet.';d.forEach(n=>{const el=document.createElement('article');el.className='notice';const title=document.createElement('h3');title.textContent=n.title||'Untitled';const p=document.createElement('p');p.textContent=n.message||'';el.append(title,p);if(n.image_url){const im=document.createElement('img');im.src=n.image_url;im.alt='Notice image';im.style.cssText='display:block;max-width:100%;max-height:520px;margin-top:12px;border-radius:8px';el.appendChild(im);const idl=document.createElement('a');idl.href=n.image_url+'?download='+encodeURIComponent('notice-image');idl.textContent='Download image';idl.style.display='inline-block';idl.style.marginTop='8px';el.appendChild(idl);}if(n.document_url){const a=document.createElement('a');a.href=n.document_url+'?download';a.target='_blank';a.rel='noopener';a.textContent='Download attached file';a.style.display='inline-block';a.style.margin='12px 12px 0 0';el.appendChild(a);}if(n.video_url){const v=document.createElement('video');v.src=n.video_url;v.controls=true;v.preload='metadata';v.style.cssText='display:block;width:100%;max-width:800px;max-height:500px;margin-top:14px;border-radius:12px';el.appendChild(v);const vd=document.createElement('a');vd.href=n.video_url+'?download='+encodeURIComponent('notice-video');vd.textContent='Download video';vd.style.display='inline-block';vd.style.marginTop='8px';el.appendChild(vd);}const meta=document.createElement('div');meta.className='meta';meta.textContent=n.created_at?new Date(n.created_at).toLocaleString():'';el.appendChild(meta);box.appendChild(el);});}catch(e){st.textContent='Could not load notices: '+e.message+'\nCheck your Supabase settings and public SELECT policy.';}}
+loadNotices();setInterval(loadNotices,5000);
+</script>)JS";
+  h += FPSTR(PAGE_FOOT);
+  return h;
+}
+
+void handleRoot() { server.send(200, "text/html; charset=utf-8", pageLogin()); }
+void handleAdmin() { server.send(200, "text/html; charset=utf-8", pageAdmin()); }
+void handleNotices() { server.send(200, "text/html; charset=utf-8", pageNotices()); }
+
+void pollSupabase() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  WiFiClientSecure client;
+  client.setInsecure(); // For a quick prototype only; production should validate TLS certificates.
+  HTTPClient http;
+  String url = String(SUPABASE_URL) + "/rest/v1/" + NOTICE_TABLE + "?select=id,title,message,created_at&order=created_at.desc&limit=1";
+  if (!http.begin(client, url)) { Serial.println("Supabase HTTP begin failed"); return; }
+  http.addHeader("apikey", SUPABASE_ANON_KEY);
+  http.addHeader("Authorization", String("Bearer ") + SUPABASE_ANON_KEY);
+  int code = http.GET();
+  if (code == HTTP_CODE_OK) {
+    String payload = http.getString();
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, payload);
+    if (!err && doc.is<JsonArray>() && doc.size() > 0) {
+      JsonObject n = doc[0];
+      String id = n["id"].isNull() ? "" : n["id"].as<String>();
+      if (id != lastNoticeId) {
+        lastNoticeId = id;
+        Serial.println("\n========== SRM AP NOTICE ==========");
+        Serial.println("Title: " + String(n["title"] | ""));
+        Serial.println("Message: " + String(n["message"] | ""));
+        Serial.println("Created: " + String(n["created_at"] | ""));
+        Serial.println("===================================\n");
+      }
+    } else if (err) {
+      Serial.print("JSON parse error: "); Serial.println(err.c_str());
+    }
+  } else {
+    Serial.printf("Supabase poll HTTP status: %d\n", code);
+    if (code > 0) Serial.println(http.getString());
+  }
+  http.end();
+}
+
+// Reads DHT11 + MQ-2, keeps the latest values for the web page (/sensor) and
+// uploads them to Supabase table board_status (used by live.html on Netlify).
+void readAndPublishSensors() {
+  float t = dht.readTemperature();
+  float h = dht.readHumidity();
+  int gasRaw = analogRead(MQ2_PIN);
+  if (isnan(t) || isnan(h)) { Serial.println("DHT11 read failed; skipping update."); return; }
+  int gasPct = constrain((gasRaw * 100L) / 4095L, 0, 100); // relative ADC %, not ppm
+  lastTemp = t; lastHum = h; lastGasRaw = gasRaw; lastGasPct = gasPct;
+  sensorValid = true; lastSensorMs = millis();
+  Serial.printf("Sensors: %.1f C, %.1f%% humidity, MQ2 raw=%d\n", t, h, gasRaw);
+  if (WiFi.status() != WL_CONNECTED) return;
+  WiFiClientSecure client;
+  client.setInsecure(); // prototype only
+  HTTPClient http;
+  String url = String(SUPABASE_URL) + "/rest/v1/board_status?on_conflict=id";
+  if (!http.begin(client, url)) return;
+  http.addHeader("apikey", SUPABASE_ANON_KEY);
+  http.addHeader("Authorization", String("Bearer ") + SUPABASE_ANON_KEY);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Prefer", "resolution=merge-duplicates,return=minimal");
+  String payload = "{\"id\":1,\"temp_c\":" + String(t, 1) + ",\"humidity\":" + String(h, 1) +
+    ",\"gas_raw\":" + String(gasRaw) + ",\"gas_percent\":" + String(gasPct) + ",\"online\":true}";
+  int code = http.POST(payload);
+  if (code < 200 || code >= 300) {
+    Serial.printf("Telemetry upload failed: HTTP %d\n", code);
+    if (code > 0) Serial.println(http.getString());
+  }
+  http.end();
+}
+
+void setup() {
+  dht.begin();
+  analogReadResolution(12);
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\nSRM AP Smart Notice Board booting...");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to Wi-Fi");
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 25000) {
+    delay(500); Serial.print('.');
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("Connected. ESP32 local IP: http://"); Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("Wi-Fi connection failed. Check SSID/password and restart.");
+  }
+  // Main page: admin login
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/login", HTTP_GET, handleRoot);
+
+  // Admin dashboard (login required in the page's JavaScript)
+  server.on("/admin", HTTP_GET, handleAdmin);
+
+  // Public/user display: support several easy-to-remember URL paths
+  server.on("/sensor", HTTP_GET, [](){
+    String j = "{\"valid\":" + String(sensorValid ? "true" : "false") +
+      ",\"temp\":" + String(lastTemp, 1) + ",\"hum\":" + String(lastHum, 1) +
+      ",\"gas\":" + String(lastGasRaw) + ",\"pct\":" + String(lastGasPct) +
+      ",\"age\":" + String(sensorValid ? (millis() - lastSensorMs) : 0UL) + "}";
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "application/json", j);
+  });
+  server.on("/notices", HTTP_GET, handleNotices);
+  server.on("/user", HTTP_GET, handleNotices);
+  server.on("/display", HTTP_GET, handleNotices);
+  server.on("/public", HTTP_GET, handleNotices);
+
+  server.onNotFound([](){
+    String message = "Page not found on the ESP32 web server.\\n\\n";
+    message += "Open the ESP32 IP address shown in Serial Monitor.\\n";
+    message += "Admin login: / or /login\\n";
+    message += "Admin dashboard: /admin\\n";
+    message += "User display: /notices, /user, /display, or /public\\n";
+    server.send(404, "text/plain; charset=utf-8", message);
+  });
+  server.begin();
+  Serial.println("Web server started on port 80.");
+  Serial.println("Open the local IP from a device on the same Wi-Fi.");
+}
+
+void loop() {
+  server.handleClient();
+  if (millis() - lastSensorRead >= SENSOR_INTERVAL_MS) {
+    lastSensorRead = millis();
+    readAndPublishSensors();
+  }
+  if (millis() - lastPoll >= POLL_INTERVAL_MS) {
+    lastPoll = millis();
+    pollSupabase();
+  }
+}
